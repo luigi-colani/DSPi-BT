@@ -34,3 +34,5 @@ __pycache__/
 !Documentation/Features/*.md
 !tools/dspi_test/test_harness.md
 !tools/dspi_test/test_failures_diag.md
+spike-bt/
+firmware/build-rp2350-btw/
