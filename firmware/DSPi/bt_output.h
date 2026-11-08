@@ -21,6 +21,18 @@ void bt_output_poll(void);
 // pipeline pushes the processed mains into bt_fifo only while this is true.
 bool bt_output_is_enabled(void);
 
+// The persisted user-enable intent (radio on/off), independent of whether a
+// stream is actually playing.  Read by bulk_params_collect() so a host GET
+// round-trips the stored BT-enabled state.  Seeded at boot from the directory
+// (preset_get_bt_enabled); default off.
+bool bt_output_user_enabled(void);
+
+// Poll for a deferred "persist the BT-enabled state" request.  Returns true and
+// writes the value to *on when the enable state changed and must be written to
+// the device-global directory; the caller (main loop) performs the flash write
+// inside its flash-write bracket.  Returns false when nothing is pending.
+bool bt_output_consume_persist_request(bool *on);
+
 // Drive the Pico 2 W onboard LED (wired to the CYW43 radio).  Safe before the
 // radio is up (no-op until cyw43_arch_init() has run).  Used for the boot
 // heartbeat since GPIO 25 is the radio chip-select on a 2 W.

@@ -53,6 +53,11 @@
 #include "audio_pipeline.h"  // output-ring stall bracket around the flash window
 #include "output_latency.h"  // option IDs for the V23 latency block sanitize
 #include "input_source_names.h"
+#include "bt_persist.h"      // bt_enabled encode/decode contract (DIR V26)
+#if DSPI_BT
+#include "bt_output.h"                  // bt_radio_resources_held() (restore-path guard)
+#include "pico/btstack_flash_bank.h"    // PICO_FLASH_BANK_STORAGE_OFFSET / _TOTAL_SIZE
+#endif
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
@@ -88,6 +93,25 @@
 // Individual sector offsets (byte offset from start of flash)
 #define DIR_SECTOR_OFFSET       (PRESET_BASE_OFFSET)
 #define SLOT_SECTOR_OFFSET(n)   (PRESET_BASE_OFFSET + (1 + (n) * SLOT_SECTORS) * FLASH_SECTOR_SIZE)
+
+#if DSPI_BT
+// BTstack stores bonds (link keys / LE device DB) in a flash-bank TLV.  The
+// pico-sdk default bank (pico/btstack_flash_bank.h) sits in the LAST sectors of
+// flash — which is exactly where DSPi's preset region lives — so left at its
+// default it would overlap and corrupt saved presets.  CMakeLists.txt pins the
+// bank to the two sectors IMMEDIATELY BELOW the preset region instead
+// (PICO_FLASH_BANK_STORAGE_OFFSET = PICO_FLASH_SIZE_BYTES - 23*FLASH_SECTOR_SIZE
+// on RP2350 = preset base - 8 KB).  These asserts are the brick-proof guard:
+// the bank must abut the preset region with no gap and no overlap, and stay
+// within flash.  (The firmware image is checked against the bank at boot by the
+// SDK's own __flash_binary_end assert in btstack_flash_bank.c.)
+_Static_assert(PICO_FLASH_BANK_STORAGE_OFFSET + PICO_FLASH_BANK_TOTAL_SIZE == PRESET_BASE_OFFSET,
+               "BTstack TLV flash bank must abut the preset region (no gap, no overlap)");
+_Static_assert(PICO_FLASH_BANK_TOTAL_SIZE == 2u * FLASH_SECTOR_SIZE,
+               "BTstack TLV flash bank must be exactly two sectors (8 KB)");
+_Static_assert(PRESET_BASE_OFFSET + PRESET_TOTAL_SECTORS * FLASH_SECTOR_SIZE == PICO_FLASH_SIZE_BYTES,
+               "preset region must reach the end of flash (bank sits just below it)");
+#endif
 
 // XIP read pointers (memory-mapped flash)
 #define DIR_ADDR                ((const PresetDirectory *)(XIP_BASE + DIR_SECTOR_OFFSET))
@@ -667,6 +691,13 @@ typedef struct __attribute__((packed)) {
 } FlashOutputLatencyConfig;                  // 4 bytes
 #define FLASH_OUTPUT_LATENCY_CONFIG_VERSION 1
 
+//
+// V26 appends a single device-global Bluetooth-output enable byte (bt_enabled;
+// DSPI_BT / Pico 2 W).  It is the last directory member, so every earlier field
+// keeps its offset; the V25->V26 migration copies the whole V25 data block and
+// leaves bt_enabled at the zero-filled default (BT off, the valid default — see
+// bt_persist.h).  Older migrations reach V26 the same way (the byte stays 0
+// from the dir_cache memset).
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -743,6 +774,12 @@ typedef struct __attribute__((packed)) {
     // V25 addition: user name for the board (device-global).  All zeros =
     // unnamed; hosts supply their own fallback.
     char device_name[DEVICE_NAME_LEN];       // 32 bytes
+
+    // V26 addition: device-global Bluetooth output enable (DSPI_BT / Pico 2 W).
+    // Board/device-level persisted intent (not a listening profile), so it lives
+    // device-global here.  All-zero = BT disabled (bt_persist.h: the valid
+    // default), so a fresh directory and every older migration need no seeding.
+    uint8_t bt_enabled;                      // 0/1; 0 = off (default)
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -1267,7 +1304,14 @@ _Static_assert(offsetof(PresetDirectory_v20, cs_display) == offsetof(PresetDirec
 _Static_assert(sizeof(PresetDirectory_v20) == 3327,
                "V20 directory geometry is frozen; snapshot any struct that grew");
 
-#define DIR_VERSION_CURRENT  25
+// V26 only appends, so a V25 directory migrates by copying its whole data block.
+#define PRESET_DIRECTORY_V25_SIZE (PRESET_DIRECTORY_V24_SIZE + 32)
+_Static_assert(offsetof(PresetDirectory, bt_enabled) == PRESET_DIRECTORY_V25_SIZE,
+               "V26 Bluetooth enable byte must directly follow the V25 layout");
+_Static_assert(sizeof(PresetDirectory) == PRESET_DIRECTORY_V25_SIZE + 1,
+               "V26 directory must be exactly one byte (bt_enabled) larger than V25");
+
+#define DIR_VERSION_CURRENT  26
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -1883,6 +1927,32 @@ static bool dir_load_cache(void) {
         dir_sanitize_output_latency();
         dir_sanitize_input_source_names();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 25) {
+        // V25 -> V26 migration.  V26 only appends the Bluetooth enable byte, so
+        // the whole V25 data block copies across and BT reads as off.
+        const uint8_t *v25_data_start = (const uint8_t *)&flash_dir->startup_mode;
+        size_t v25_data_len = PRESET_DIRECTORY_V25_SIZE - offsetof(PresetDirectory, startup_mode);
+        if (crc32(v25_data_start, v25_data_len) != flash_dir->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        // Header excluded: dir_flush() restamps magic/version/crc.
+        memcpy(&dir_cache.startup_mode, v25_data_start, v25_data_len);
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
+        dir_sanitize_cs_display();
+        dir_sanitize_limiter();
+        dir_sanitize_output_latency();
+        dir_sanitize_input_source_names();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -3525,7 +3595,15 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
             pin = PICO_ADAT_PIN;               // stored pin conflicts; try default
             pin_ok = adat_pin_acceptable(pin);
         }
-        adat_output_set_config(cfg->adat_enabled != 0 && pin_ok, pin);
+        bool adat_en = cfg->adat_enabled != 0 && pin_ok;
+#if DSPI_BT
+        // Task 3 radio interlock (restore path): the ADAT bulk output was stood
+        // down so the CYW43 radio could claim its PIO SM1 + DMA.  A stored
+        // output-config must not re-enable it while the radio holds those
+        // resources; the stored intent is reapplied once the radio is disabled.
+        if (adat_en && bt_radio_resources_held()) adat_en = false;
+#endif
+        adat_output_set_config(adat_en, pin);
         if (adat_output_config_enabled() == adat_out_was_en &&
             adat_output_pin() == adat_out_was_pin)
             adat_output_config_dirty = adat_out_was_dirty;
@@ -4190,7 +4268,17 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         }
     }
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
-        matrix_mixer.outputs[out].enabled = slot->matrix_outputs[out].enabled;
+        bool out_enabled = slot->matrix_outputs[out].enabled != 0;
+#if DSPI_BT
+        // Task 3 radio interlock (restore path): while the CYW43 radio holds the
+        // PIO SM / DMA freed by standing down the PDM sub, a loaded preset must
+        // not bring the PDM output (the last output) back up.  Mirrors the
+        // REQ_SET_OUTPUT_ENABLE and bulk-apply guards; the stored enable is
+        // honoured again once the radio is disabled.
+        if (out == NUM_OUTPUT_CHANNELS - 1 && out_enabled && bt_radio_resources_held())
+            out_enabled = false;
+#endif
+        matrix_mixer.outputs[out].enabled = out_enabled ? 1 : 0;
         matrix_mixer.outputs[out].mute = slot->matrix_outputs[out].mute;
         matrix_mixer.outputs[out].gain_db = slot->matrix_outputs[out].gain_db;
         matrix_mixer.outputs[out].gain_linear = db_to_linear(slot->matrix_outputs[out].gain_db);
@@ -4759,6 +4847,23 @@ uint8_t preset_set_input_source_names(uint8_t mask,
         dir_cache.device_name[DEVICE_NAME_LEN - 1] = '\0';
     }
     return dir_flush() == 0 ? PRESET_OK : PRESET_ERR_FLASH_WRITE;
+
+// Device-global Bluetooth-output enable persistence (DIR V26+).  Mirrors
+// preset_set_dac_hw_mute: synchronous, main-loop only, writes the directory
+// sector once.  The setter writes only when the stored value actually changes,
+// so toggling BT does not burn a flash erase/program cycle on every no-op SET.
+// Read at boot (bt_output_init) to seed the live enable state; 0 = off.
+void preset_set_bt_enabled(bool on) {
+    dir_ensure();
+    uint8_t v = bt_persist_encode_enabled(on);
+    if (dir_cache.bt_enabled == v) return;   // no change -> no flash write
+    dir_cache.bt_enabled = v;
+    dir_flush();
+}
+
+bool preset_get_bt_enabled(void) {
+    dir_ensure();
+    return bt_persist_decode_enabled(dir_cache.bt_enabled);
 }
 
 // Control-interface (UART/I2C) persistence.  Mirrors preset_set_dac_hw_mute:

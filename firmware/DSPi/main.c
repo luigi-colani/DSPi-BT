@@ -2384,6 +2384,21 @@ int main(void) {
                 complete_flash_write_operation_full();
             }
 
+#if DSPI_BT
+            // Bluetooth-enabled state persistence (Task 6).  bt_output_poll()
+            // flags a change from the main loop; persist it to the device-global
+            // directory here inside the flash-write bracket (preset_set_bt_enabled
+            // dedupes no-ops, so this only writes flash when the state changed).
+            {
+                bool bt_on;
+                if (bt_output_consume_persist_request(&bt_on)) {
+                    prepare_flash_write_operation();
+                    preset_set_bt_enabled(bt_on);
+                    complete_flash_write_operation_full();
+                }
+            }
+#endif
+
             // UART / I2C control-interface config (USB-only SETs, deferred).
             // Live apply first (GPIO/IRQ work, no flash); persist to the
             // directory only when the new config validated, so a bad SET

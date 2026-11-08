@@ -34,7 +34,14 @@
 
 #include "bt_fifo.h"
 #include "bt_metrics.h"
+#include "bt_persist.h"       // bt_persist_encode/decode (shared enable contract)
 #include "notify.h"
+
+// Boot seed of the persisted BT-enable state.  Forward-declared (not via
+// flash_storage.h) so this file keeps its local NUM_CHANNELS==2 A2DP context
+// without pulling in config.h's firmware-wide NUM_CHANNELS.  The deferred
+// persist write (preset_set_bt_enabled) is performed from main.c.
+bool preset_get_bt_enabled(void);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -220,9 +227,20 @@ static volatile bool s_disconnect_pending = false;
 static volatile bool s_forget_pending = false;
 static bd_addr_t     s_forget_addr;
 
-static bool s_user_enabled  = true;   // BT on at boot (Task 2-4 behaviour)
+// Seeded from the persisted directory value in bt_output_init() (Task 6).
+// Default off: an un-provisioned device / a config that predates BT boots with
+// the radio idle (bt_persist.h: BT-disabled is the valid default).
+static bool s_user_enabled  = false;
 static bool s_user_directed = false;  // a command has steered the link: suppress the
-                                      // BT_TEST_SINK_ADDR boot auto-connect fallback
+                                      // stored-sink boot auto-connect fallback
+
+// Deferred persistence of the enable state (Task 6).  bt_service_commands()
+// (main loop) sets these when the state commits; main.c drains them inside its
+// flash-write bracket (preset_set_bt_enabled), so the directory write never runs
+// nested in the radio stand-down / pipeline-reset bracket.
+static volatile bool    s_persist_pending = false;
+static volatile uint8_t s_persist_val     = 0;
+static void bt_mark_persist(bool on){ s_persist_val = bt_persist_encode_enabled(on); s_persist_pending = true; }
 static bool s_radio_ok      = false;  // bring-up fully succeeded
 static volatile bool s_hci_working = false;
 static volatile bool s_inquiry_active = false;  // inquiry running
@@ -472,6 +490,24 @@ static bool bt_is_bonded(const bd_addr_t addr){
     return found;
 }
 
+// The stored sink to reconnect to at boot: the first bonded device in the
+// BTstack link-key TLV (persisted across power cycles in the dedicated flash
+// bank — see flash_storage.c / CMakeLists.txt).  Returns false when no bond is
+// stored, so the caller degrades to idle/scannable instead of connecting to a
+// hard-coded address.  (One A2DP sink at a time; the first bond is the sink.)
+static bool bt_stored_sink(bd_addr_t out){
+    btstack_link_key_iterator_t it;
+    if (!gap_link_key_iterator_init(&it)) return false;
+    bd_addr_t a; link_key_t k; link_key_type_t t;
+    bool found = false;
+    if (gap_link_key_iterator_get_next(&it, a, k, &t)){
+        memcpy(out, a, 6);
+        found = true;
+    }
+    gap_link_key_iterator_done(&it);
+    return found;
+}
+
 // Resolve the next unnamed scan entry (or finish the scan).
 static void bt_scan_next_name(void){
     while (s_name_idx < s_scan_count){
@@ -499,13 +535,29 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 break;
             }
             s_hci_working = true;
-            // Boot-time measurement fallback: auto-connect to the fixed test sink
-            // ONLY while no vendor command has directed the link.
+            // Reconnect-on-boot (Task 6): auto-connect to the STORED bonded sink
+            // (the persisted link key) ONLY while no vendor command has directed
+            // the link.  Graceful fallback: with no stored bond, stay idle and
+            // scannable rather than connect to a hard-coded address; if the
+            // establish call errors synchronously, clear the connecting state so
+            // a stale/absent bond degrades to idle and never hangs the audio
+            // path (the async CONNECTION_ESTABLISHED failure path does the same).
             if (!s_user_directed){
-                printf("[bt] HCI working, connecting to sink %s...\n", device_addr_string);
-                s_connecting = true;
-                memcpy(s_target_addr, device_addr, 6);
-                a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+                bd_addr_t sink;
+                if (bt_stored_sink(sink)){
+                    printf("[bt] HCI working, reconnecting to stored sink %s...\n", bd_addr_to_str(sink));
+                    s_connecting = true;
+                    memcpy(device_addr, sink, 6);
+                    memcpy(s_target_addr, sink, 6);
+                    uint8_t st = a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+                    if (st != ERROR_CODE_SUCCESS){
+                        printf("[bt] stored-sink reconnect failed to start (0x%02x); idle/scannable\n", st);
+                        s_connecting = false;
+                        s_last_status = st;
+                    }
+                } else {
+                    printf("[bt] HCI working, no stored bond; idle/scannable\n");
+                }
             } else {
                 printf("[bt] HCI working (awaiting vendor-command connect)\n");
             }
@@ -767,6 +819,14 @@ void bt_output_init(void){
     // Fast, non-blocking only — this runs before the main loop.
     bt_fifo_init(&s_fifo);
 
+    // Seed the enable state from the persisted device-global directory (Task 6).
+    // Runs after preset_boot_load() (main.c ordering), so the directory cache is
+    // populated.  Default off: an un-provisioned device stays idle; only a
+    // device whose stored config has BT on brings the radio up and reconnects to
+    // the stored sink.  This is the boot read; no persist (no change).
+    s_user_enabled = preset_get_bt_enabled();
+    printf("[bt] boot enable state: %s (persisted)\n", s_user_enabled ? "on" : "off");
+
     // Bring up USB-serial (CDC) for the [btm] metrics line + BTstack logs.
     // The app already called tud_init(0) in core0_init (usb_sound_card_init),
     // so pico_stdio_usb only enables its stdio driver here — it does not start
@@ -832,6 +892,7 @@ static void bt_service_commands(void){
                 s_codec = BT_CODEC_NONE;
                 media_tracker.a2dp_cid = 0; media_tracker.avrcp_cid = 0; media_tracker.stream_opened = 0;
                 s_user_enabled = false;
+                bt_mark_persist(false);                // persist BT off (deferred)
                 printf("[bt] disabled\n");
                 bt_restore_outputs();
             } else {
@@ -840,6 +901,7 @@ static void bt_service_commands(void){
                 bt_radio_standdown(true, &mask);
                 bt_pipeline_reset_complete();
                 s_user_enabled = true;
+                bt_mark_persist(true);                 // persist BT on (deferred)
                 s_last_status = BT_ERR_NONE;
                 cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_ON); cyw43_arch_lwip_end();  // -> BTSTACK_EVENT_STATE WORKING
                 printf("[bt] enabled (stand-down mask=0x%02x)\n", mask);
@@ -980,6 +1042,7 @@ void bt_output_poll(void){
         s_enable_pending = false;
         s_user_enabled = s_enable_req;
         if (!s_user_enabled) s_user_directed = true;
+        bt_mark_persist(s_user_enabled);   // persist the new intent (setter dedupes)
     }
     if (!s_user_enabled) return;
     if (!tud_mounted()) return;      // let USB enumerate first
@@ -1056,6 +1119,17 @@ bool __not_in_flash_func(bt_output_is_enabled)(void){
 void bt_output_led(bool on){
     if (!s_cyw43_ready) return;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
+}
+
+bool bt_output_user_enabled(void){
+    return s_user_enabled;
+}
+
+bool bt_output_consume_persist_request(bool *on){
+    if (!s_persist_pending) return false;
+    s_persist_pending = false;
+    if (on) *on = bt_persist_decode_enabled(s_persist_val);
+    return true;
 }
 
 bool bt_radio_resources_held(void){

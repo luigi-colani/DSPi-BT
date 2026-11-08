@@ -23,6 +23,10 @@
 #include "upmix.h"     // upmix_config / upmix_update_pending (RP2350; header body #if-guarded)
 #include "tube.h"      // tube_config / tube_update_pending
 #include "limiter.h"   // limiter_config / limiter_update_pending
+#include "bt_persist.h" // bt_persist_encode/decode_enabled (wire bt-config contract)
+#if DSPI_BT
+#include "bt_output.h"  // bt_output_user_enabled / bt_request_enable (DSPI_BT only)
+#endif
 #include "notify.h"
 #include "uart_control.h"
 #include "i2c_control.h"
@@ -61,9 +65,14 @@ _Static_assert(offsetof(WireBulkParams, tube) == 5980,
 _Static_assert(sizeof(WireLimiterParams) == 108, "V32 limiter section must be 108 bytes");
 _Static_assert(offsetof(WireBulkParams, limiter) == 6028,
                "V32 limiter section must sit at wire offset 6028");
-_Static_assert(sizeof(WireBulkParams) == 6136,
-               "V32 wire total must be 6136 bytes");
 _Static_assert(NUM_OUTPUT_CHANNELS <= WIRE_MAX_OUTPUT_CHANNELS, "limiter wire records");
+_Static_assert(sizeof(WireBtConfig) == 8, "V33 Bluetooth section must be 8 bytes");
+// V33 tail-appends the Bluetooth section at the former end-of-packet offset
+// (6136), so nothing ahead of it shifts; hosts hard-code this number.
+_Static_assert(offsetof(WireBulkParams, bt) == 6136,
+               "V33 Bluetooth section must sit at wire offset 6136 (tail-append)");
+_Static_assert(sizeof(WireBulkParams) == 6144,
+               "V33 wire total must be 6144 bytes");
 #if PICO_RP2350
 _Static_assert(sizeof(WireUpmixParams) == sizeof(UpmixConfigPacket),
                "WireUpmixParams and UpmixConfigPacket must have identical layout");
@@ -370,6 +379,13 @@ void bulk_params_collect(WireBulkParams *out) {
     upmix_config_to_packet(&pkt);
     memcpy(&out->upmix, &pkt, sizeof(pkt));   // layout identity asserted above
 #endif
+
+    // Bluetooth output config (V29+).  DSPI_BT only; the whole section
+    // (including reserved) stays zeroed from the memset above on other builds,
+    // which an old host / non-BT device correctly reads as BT-disabled.
+#if DSPI_BT
+    out->bt.enabled = bt_persist_encode_enabled(bt_output_user_enabled());
+#endif
 }
 
 // ============================================================================
@@ -446,9 +462,19 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         }
     }
 
-    // Matrix outputs
+    // Matrix outputs.  Task 3 radio interlock (restore path): while the CYW43
+    // radio holds the PIO SM / DMA freed by standing down the PDM sub, a pushed
+    // config must not bring the PDM output (the last output) back up — it would
+    // re-claim resources the radio now owns.  Mirrors the REQ_SET_OUTPUT_ENABLE
+    // guard in vendor_commands.c; the stored intent is honoured again once the
+    // radio is disabled (the config is reapplied on the next restore/enable).
     for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
-        matrix_mixer.outputs[o].enabled = in->outputs[o].enabled;
+        bool want_enabled = (in->outputs[o].enabled != 0);
+#if DSPI_BT
+        if (o == NUM_OUTPUT_CHANNELS - 1 && want_enabled && bt_radio_resources_held())
+            want_enabled = false;
+#endif
+        matrix_mixer.outputs[o].enabled = want_enabled ? 1 : 0;
         matrix_mixer.outputs[o].mute = in->outputs[o].mute;
         matrix_mixer.outputs[o].gain_db = in->outputs[o].gain_db;
         matrix_mixer.outputs[o].gain_linear = db_to_linear(in->outputs[o].gain_db);
@@ -735,6 +761,13 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
                 enabled = 0;
             }
         }
+#if DSPI_BT
+        // Task 3 radio interlock (restore path): the ADAT bulk output was stood
+        // down so the radio could claim its PIO SM1 + DMA.  A pushed config must
+        // not re-enable it while the radio holds those resources; the stored
+        // enable intent is honoured again once the radio is disabled.
+        if (enabled && bt_radio_resources_held()) enabled = 0;
+#endif
         adat_output_set_config(enabled != 0, pin);
         if (adat_output_config_enabled() == adat_out_was_en &&
             adat_output_pin() == adat_out_was_pin)
@@ -1015,6 +1048,15 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         upmix_config.presence_db        = upmix_presence_decode(in->upmix.presence_q1);
         upmix_update_pending = true;
     }
+#endif
+
+    // Bluetooth output config (V29+).  DSPI_BT only; other builds ignore the
+    // section.  Route the persisted enable intent through the deferred vendor
+    // path (flag only; bt_output_poll() performs the radio work from the main
+    // loop and persists the new state), so a bulk SET toggles BT exactly like
+    // REQ_BT_ENABLE.  An old host / zero section decodes as "BT off".
+#if DSPI_BT
+    bt_request_enable(bt_persist_decode_enabled(in->bt.enabled));
 #endif
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).

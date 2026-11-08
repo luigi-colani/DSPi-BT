@@ -120,6 +120,13 @@ uint8_t preset_set_input_source_names(uint8_t mask,
                                       const char *device_name);
 const char *preset_stored_device_name(void);
 
+// Device-global Bluetooth-output enable (DIR V26+; DSPI_BT / Pico 2 W).  The
+// persisted BT on/off intent.  Setter is synchronous, main-loop only, and
+// writes the directory sector only when the value changes; getter reads the RAM
+// cache.  Read at boot to seed the live radio-enable state; default 0 (off).
+void preset_set_bt_enabled(bool on);
+bool preset_get_bt_enabled(void);
+
 // External control-interface config (UART/I2C, board-level, directory-stored,
 // V6+).  Setter is synchronous and main-loop only; a NULL pointer leaves that
 // interface's stored config unchanged.  Getter copies out; either may be NULL.

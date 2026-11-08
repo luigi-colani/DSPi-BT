@@ -156,9 +156,33 @@ if (DSPI_BT)
     if (NOT PICO_BOARD STREQUAL "pico2_w")
         message(FATAL_ERROR "DSPI_BT=ON requires -DPICO_BOARD=pico2_w (got '${PICO_BOARD}')")
     endif()
-    target_sources(DSPi PRIVATE bt_output.c bt_output.h bt_fifo.h bt_metrics.h btstack_config.h)
+    target_sources(DSPi PRIVATE bt_output.c bt_output.h bt_fifo.h bt_metrics.h btstack_config.h bt_persist.h)
     # CYW43_LWIP=0: Bluetooth only, no Wi-Fi/IP stack (no lwIP linked).
     target_compile_definitions(DSPi PRIVATE DSPI_BT=1 CYW43_LWIP=0)
+
+    # BTstack link-key TLV flash bank placement.  The pico-sdk default bank sits
+    # in the LAST sectors of flash, which is exactly where DSPi's preset region
+    # lives (flash_storage.c: the last 1 + 10*2 = 21 sectors on RP2350) — so the
+    # default would overlap and corrupt saved presets/bonds.  Pin the two-sector
+    # (8 KB) bank to the two sectors IMMEDIATELY BELOW the preset region instead:
+    #   flash size    = 4 MiB         (Pico 2 W)
+    #   sector        = 4 KiB
+    #   preset base   = 4 MiB - 21*4 KiB = 0x3EB000
+    #   bank offset   = preset base - 2*4 KiB = 4 MiB - 23*4 KiB = 0x3E9000
+    #   bank total    = 2*4 KiB = 0x2000  -> bank spans [0x3E9000, 0x3EB000)
+    # Computed here as plain integer literals (CMake cannot forward a parenthesised
+    # function-style macro to the compiler).  DSPI_BT is Pico 2 W only, so the flash
+    # size / sector / preset-sector count are all fixed; flash_storage.c carries the
+    # brick-proof _Static_asserts tying these numbers back to PICO_FLASH_SIZE_BYTES,
+    # FLASH_SECTOR_SIZE and PRESET_BASE_OFFSET so any geometry drift fails the build.
+    math(EXPR DSPI_BT_FLASH_SECTOR  "4 * 1024")
+    math(EXPR DSPI_BT_FLASH_SIZE    "4 * 1024 * 1024")
+    math(EXPR DSPI_BT_BANK_TOTAL    "${DSPI_BT_FLASH_SECTOR} * 2")
+    math(EXPR DSPI_BT_BANK_OFFSET   "${DSPI_BT_FLASH_SIZE} - 23 * ${DSPI_BT_FLASH_SECTOR}" OUTPUT_FORMAT HEXADECIMAL)
+    target_compile_definitions(DSPi PRIVATE
+        PICO_FLASH_BANK_TOTAL_SIZE=${DSPI_BT_BANK_TOTAL}
+        PICO_FLASH_BANK_STORAGE_OFFSET=${DSPI_BT_BANK_OFFSET}
+    )
     target_link_libraries(DSPi
         pico_cyw43_arch_threadsafe_background
         pico_btstack_classic
