@@ -1452,6 +1452,18 @@ static void complete_pipeline_reset(void) {
 #endif
 }
 
+#if DSPI_BT
+// Narrow bracket wrappers for the Bluetooth radio stand-down (bt_output_poll in
+// bt_output.c).  They expose the static pipeline-reset primitives so the PDM +
+// ADAT stand-down (and its restore on a radio-init failure) runs click-free
+// against the still-active S/PDIF mains, and the ADAT stream is torn down
+// synchronously (complete_pipeline_reset -> adat_output_resync, which stops the
+// stream once its config is disabled) BEFORE the blocking cyw43_arch_init().
+bool bt_pipeline_reset_ready(void)    { return pipeline_reset_ready(); }
+void bt_pipeline_reset_prepare(void)  { prepare_pipeline_reset(PRESET_MUTE_SAMPLES); }
+void bt_pipeline_reset_complete(void) { complete_pipeline_reset(); }
+#endif
+
 // Disable all outputs, stop their DMA and reset their rings. Outputs stay
 // disabled so the rings can be prefilled before starting playback.
 // Counterpart: enable_outputs_in_sync().

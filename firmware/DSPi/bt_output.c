@@ -605,19 +605,35 @@ void bt_output_poll(void){
     }
     if (++s_bringup_ticks < 200) return;
 
+    // The stand-down + radio init are disruptive: gate on the pipeline being
+    // reset-ready like every other reset op, and retry next tick if not (so the
+    // mute/settle bracket below is entered from a safe state).
+    if (!bt_pipeline_reset_ready()) return;
+
     s_bringup_done = true;
 
-    // Resource mutual-exclusion MUST run before cyw43_arch_init(): stand down
-    // the PIO1-resident wired outputs (PDM sub, ADAT bulk) so the radio can
-    // claim a free PIO state machine + DMA pair + its GPIOs.  Reports which
-    // outputs it disabled so the budget/measurement log can account for them.
+    // Resource mutual-exclusion MUST run before cyw43_arch_init().  Stand down
+    // the PIO1-resident wired outputs (PDM sub, ADAT bulk) as a logical
+    // reservation, BRACKETED by prepare/complete_pipeline_reset so the
+    // still-active S/PDIF mains stay click-free and the ADAT stream is torn down
+    // synchronously (complete -> adat_output_resync) before the blocking init.
+    // (Whether the radio actually needs this to find a free SM/DMA — a spare may
+    // already exist under USB input — is confirmed by the init line below.)
     uint8_t stood_down = 0;
-    bt_output_enable(true, &stood_down);
+    bt_pipeline_reset_prepare();
+    bt_radio_standdown(true, &stood_down);
+    bt_pipeline_reset_complete();
     printf("[bt] output stand-down mask=0x%02x (bit0=PDM bit1=ADAT)\n", stood_down);
 
     printf("[bt] cyw43_arch_init...\n");
     if (cyw43_arch_init()){
-        printf("[bt] cyw43_arch_init FAILED\n");
+        printf("[bt] cyw43_arch_init FAILED; restoring stood-down outputs\n");
+        // A radio failure must not leave the user's outputs dead: restore the
+        // stand-down (bracketed, so the restart is click-free too).
+        uint8_t restored = 0;
+        bt_pipeline_reset_prepare();
+        bt_radio_standdown(false, &restored);
+        bt_pipeline_reset_complete();
         return;
     }
     s_cyw43_ready = true;

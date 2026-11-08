@@ -17,7 +17,7 @@
  * These are platform-independent integer/bit logic, so they are fully
  * verifiable on the host without any Pico SDK or hardware.  The resolution
  * *table* (which stand-down bits come back for each active-output combination)
- * is the contract the firmware's bt_output_enable() applies, and the pin
+ * is the contract the firmware's bt_radio_standdown() applies, and the pin
  * predicate is the contract is_valid_gpio_pin() enforces.
  *
  * Build + run:  make        (in this directory)
@@ -92,6 +92,50 @@ static void test_radio_pins_are_exactly_four(void) {
 }
 
 // ---------------------------------------------------------------------------
+// gpio_pin_assignable() — the exact rule is_valid_gpio_pin() delegates to.
+// Exercises the reserved-pin logic across the build axes so a regression in it
+// (e.g. dropping the +29 radio reservation, or widening the upper bound) is
+// caught here rather than only on hardware.
+// ---------------------------------------------------------------------------
+
+static void test_pin_assignable_radio_reservation(void) {
+    printf("test_pin_assignable_radio_reservation\n");
+    // RP2350 axis (Pico 2 / Pico 2 W).
+    // GPIO 29 (WL_CLK): REJECTED on the BT build, ACCEPTED on non-BT RP2350.
+    CHECK(!gpio_pin_assignable(29, /*radio_build=*/true,  /*rp2350=*/true));
+    CHECK( gpio_pin_assignable(29, /*radio_build=*/false, /*rp2350=*/true));
+
+    // GPIO 23/24/25: these three radio pins fall inside the power/LED block
+    // (23-25), so they are rejected on BOTH builds anyway — 29 is the ONLY pin
+    // whose rejection is radio-specific (asserted above).
+    for (uint8_t g = 23; g <= 25; g++) {
+        CHECK(!gpio_pin_assignable(g, true,  true));
+        CHECK(!gpio_pin_assignable(g, false, true));
+    }
+
+    // GPIO 26/27/28: valid RP2350 pins, NOT radio pins — accepted on BOTH.
+    for (uint8_t g = 26; g <= 28; g++) {
+        CHECK(gpio_pin_assignable(g, true,  true));
+        CHECK(gpio_pin_assignable(g, false, true));
+    }
+
+    // A representative real output/clock pin is always assignable.
+    CHECK(gpio_pin_assignable(6,  true,  true));   // S/PDIF 1
+    CHECK(gpio_pin_assignable(10, true,  true));   // PDM sub
+    CHECK(gpio_pin_assignable(12, true,  true));   // ADAT
+}
+
+static void test_pin_assignable_upper_bound(void) {
+    printf("test_pin_assignable_upper_bound\n");
+    // RP2350 tops out at 29, RP2040 at 28.
+    CHECK( gpio_pin_assignable(29, false, /*rp2350=*/true));
+    CHECK(!gpio_pin_assignable(29, false, /*rp2350=*/false));  // RP2040: no GPIO 29
+    CHECK( gpio_pin_assignable(28, false, false));             // RP2040: 28 ok
+    CHECK(!gpio_pin_assignable(30, true,  true));              // out of range
+    CHECK(!gpio_pin_assignable(30, false, true));
+}
+
+// ---------------------------------------------------------------------------
 // bt_output_standdown_resolve()
 // ---------------------------------------------------------------------------
 
@@ -131,6 +175,8 @@ int main(void) {
     test_radio_pins_reserved();
     test_non_radio_pins_free();
     test_radio_pins_are_exactly_four();
+    test_pin_assignable_radio_reservation();
+    test_pin_assignable_upper_bound();
     test_standdown_resolution_table();
     test_standdown_bits_distinct();
 

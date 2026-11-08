@@ -373,18 +373,20 @@ static const uint8_t default_output_pins[NUM_PIN_OUTPUTS] = {
 bool is_valid_gpio_pin(uint8_t pin) {
     // GPIO 16/17 are general-purpose again since the debug UART was removed;
     // when the UART control interface claims them, is_pin_in_use() covers it.
-    if (pin >= 23 && pin <= 25) return false;   // Power/LED
+    // The assignability rule (23-25 power/LED always rejected; the CYW43 radio
+    // additionally reserves 29 on the DSPI_BT build; upper bound 29 on RP2350,
+    // 28 on RP2040) lives in bt_exclusion.h so the host test exercises it.
 #if DSPI_BT
-    // Pico 2 W: the CYW43 radio owns GPIO 23/24/25/29.  23-25 are already
-    // rejected above; this additionally reserves 29 (VSYS ADC / WL_CLK) so no
-    // output, clock, or RX pin-config can land on a pad the radio is driving.
-    if (gpio_reserved_for_radio(pin)) return false;
+    const bool radio_build = true;   // Pico 2 W: radio owns 23/24/25/29
+#else
+    const bool radio_build = false;
 #endif
 #if PICO_RP2350
-    return pin <= 29;
+    const bool rp2350 = true;
 #else
-    return pin <= 28;
+    const bool rp2350 = false;
 #endif
+    return gpio_pin_assignable(pin, radio_build, rp2350);
 }
 
 #if DSPI_BT
@@ -400,8 +402,8 @@ bool is_valid_gpio_pin(uint8_t pin) {
 // mute-bracketed ADAT config apply for the ADAT bulk output — so the still-active
 // S/PDIF mains (which feed the BT stream) are never disturbed and never click.
 
-// Which PIO1 wired outputs the last bt_output_enable(true) disabled, so a later
-// bt_output_enable(false) re-enables exactly those.
+// Which PIO1 wired outputs the last bt_radio_standdown(true) disabled, so a
+// later bt_radio_standdown(false) re-enables exactly those.
 static uint8_t s_bt_standdown_mask = 0;
 
 static void bt_pdm_set_output_enabled(bool en) {
@@ -421,7 +423,7 @@ static void bt_pdm_set_output_enabled(bool en) {
         + offsetof(WireOutputChannel, enabled)), 1, &v);
 }
 
-bool bt_output_enable(bool on, uint8_t *stood_down_mask) {
+bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
     uint8_t mask;
     if (on) {
         bool pdm_active  = matrix_mixer.outputs[NUM_OUTPUT_CHANNELS - 1].enabled != 0;
@@ -3781,11 +3783,12 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
                     // ADAT is not yet config-enabled, so it never blocks itself.
                     uint8_t pin = adat_output_pin();
 #if DSPI_BT
-                    // Radio interlock: the ADAT bulk output was stood down (and
-                    // its PIO1 SM1 + DMA 13/14 freed) so the CYW43 radio could
-                    // claim them.  Refuse to re-enable while the radio holds them.
+                    // Radio interlock: the ADAT bulk output was stood down (its
+                    // PIO1 SM1 + DMA 13/14 logically reserved) so the CYW43 radio
+                    // could claim them.  Refuse to re-enable while the radio holds
+                    // its resources.
                     if (bt_radio_resources_held()) {
-                        status = PIN_CONFIG_OUTPUT_ACTIVE;
+                        status = PIN_CONFIG_RADIO_RESERVED;
                     } else
 #endif
                     if (!is_valid_gpio_pin(pin)) {

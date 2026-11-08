@@ -723,6 +723,7 @@ typedef struct __attribute__((packed)) {
 #define PIN_CONFIG_INVALID_OUTPUT   0x03
 #define PIN_CONFIG_OUTPUT_ACTIVE    0x04
 #define PIN_CONFIG_INVALID_PARAM    0x05  // non-pin field out of range (baud, I2C address)
+#define PIN_CONFIG_RADIO_RESERVED   0x06  // DSPI_BT: resource/pin held by the CYW43 radio
 
 // Output type identifiers
 #define OUTPUT_TYPE_SPDIF           0

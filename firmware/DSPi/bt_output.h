@@ -34,10 +34,23 @@ bool bt_radio_resources_held(void);
 // Resource mutual-exclusion (implemented in vendor_commands.c, where the output
 // matrix + PDM/ADAT teardown machinery live).  Stand down (on=true) or restore
 // (on=false) the PIO1-resident wired outputs that contend with the radio for a
-// PIO state machine + DMA, so cyw43_arch_init() can claim them.  Reports the set
-// it changed via *stood_down_mask (BT_STOODDOWN_* bits from bt_exclusion.h);
-// returns true iff anything changed.  Must run on Core 0, before the radio init.
-bool bt_output_enable(bool on, uint8_t *stood_down_mask);
+// PIO state machine + DMA, as a logical reservation ahead of cyw43_arch_init().
+// Reports the set it changed via *stood_down_mask (BT_STOODDOWN_* bits from
+// bt_exclusion.h); returns true iff anything changed.  Must run on Core 0 inside
+// a prepare/complete_pipeline_reset() bracket (see bt_output_poll) so the
+// still-active S/PDIF mains stay click-free.  NB renamed from bt_output_enable
+// (Task 3 review) to avoid confusion with bt_output_is_enabled() — Task 5's
+// REQ_BT_* enable/disable caller must use THIS name.
+bool bt_radio_standdown(bool on, uint8_t *stood_down_mask);
+
+// Pipeline-reset bracket wrappers (implemented in main.c, where the static
+// prepare_pipeline_reset/complete_pipeline_reset + pipeline_reset_ready live).
+// bt_output_poll() brackets the stand-down/restore with these so the teardown
+// is click-free and the ADAT stream is torn down synchronously (complete ->
+// adat_output_resync) before the blocking radio init.
+bool bt_pipeline_reset_ready(void);
+void bt_pipeline_reset_prepare(void);
+void bt_pipeline_reset_complete(void);
 
 #endif // DSPI_BT
 
