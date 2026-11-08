@@ -208,6 +208,7 @@ static bt_scan_entry_t s_scan[BT_SCAN_MAX];
 static volatile uint8_t s_scan_count = 0;
 static uint8_t s_name_idx = 0;
 static volatile bool s_scan_abort = false;
+static uint32_t s_redirect_start_ms = 0;
 
 static volatile bool s_enable_pending = false;
 static volatile bool s_enable_req = true;
@@ -790,8 +791,17 @@ static void bt_restore_outputs(void){
 }
 
 static void bt_do_disconnect(void){
-    if (s_a2dp_connected || s_connecting){
-        if (media_tracker.a2dp_cid) a2dp_source_disconnect(media_tracker.a2dp_cid);
+    if (!(s_a2dp_connected || s_connecting)) return;
+    if (media_tracker.a2dp_cid){
+        cyw43_arch_lwip_begin();
+        a2dp_source_disconnect(media_tracker.a2dp_cid);
+        cyw43_arch_lwip_end();
+    } else {
+        // Connect in flight but no cid yet: nothing addressable to tear down.
+        // Clear the flags so the state machine cannot wait on an event that
+        // will never arrive (a late CONNECTION_ESTABLISHED re-sets them).
+        s_connecting = false;
+        s_a2dp_connected = false;
     }
 }
 
@@ -813,11 +823,11 @@ static void bt_service_commands(void){
                 // BT off: drop the link/scan, stop streaming, power the
                 // controller down, then give the wired outputs back.
                 s_bt_enabled = false;                  // pipeline stops pushing
-                a2dp_timer_stop(&media_tracker);
-                if (s_inquiry_active) gap_inquiry_stop();
+                cyw43_arch_lwip_begin(); a2dp_timer_stop(&media_tracker); cyw43_arch_lwip_end();
+                if (s_inquiry_active){ cyw43_arch_lwip_begin(); gap_inquiry_stop(); cyw43_arch_lwip_end(); }
                 s_scan_abort = true; s_scanning = false; s_inquiry_active = false;
                 s_connect_pending = s_disconnect_pending = s_forget_pending = s_scan_pending = false;
-                hci_power_control(HCI_POWER_OFF);
+                cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_OFF); cyw43_arch_lwip_end();
                 s_hci_working = false; s_connecting = false; s_a2dp_connected = false;
                 s_codec = BT_CODEC_NONE;
                 media_tracker.a2dp_cid = 0; media_tracker.avrcp_cid = 0; media_tracker.stream_opened = 0;
@@ -831,7 +841,7 @@ static void bt_service_commands(void){
                 bt_pipeline_reset_complete();
                 s_user_enabled = true;
                 s_last_status = BT_ERR_NONE;
-                hci_power_control(HCI_POWER_ON);        // -> BTSTACK_EVENT_STATE WORKING
+                cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_ON); cyw43_arch_lwip_end();  // -> BTSTACK_EVENT_STATE WORKING
                 printf("[bt] enabled (stand-down mask=0x%02x)\n", mask);
             }
         }
@@ -859,7 +869,7 @@ static void bt_service_commands(void){
         s_forget_pending = false;
         s_user_directed = true;
         if (bt_link_busy() && memcmp(s_target_addr, s_forget_addr, 6) == 0) bt_do_disconnect();
-        gap_drop_link_key_for_bd_addr(s_forget_addr);
+        cyw43_arch_lwip_begin(); gap_drop_link_key_for_bd_addr(s_forget_addr); cyw43_arch_lwip_end();
         for (uint8_t i = 0; i < s_scan_count; i++)
             if (memcmp(s_scan[i].addr, s_forget_addr, 6) == 0) s_scan[i].flags &= (uint8_t)~BT_SCAN_FLAG_BONDED;
         printf("[bt] forgot %s\n", bd_addr_to_str(s_forget_addr));
@@ -870,23 +880,34 @@ static void bt_service_commands(void){
         s_user_directed = true;
         if (s_scanning){
             s_scan_abort = true;
-            if (s_inquiry_active) gap_inquiry_stop();
+            if (s_inquiry_active){ cyw43_arch_lwip_begin(); gap_inquiry_stop(); cyw43_arch_lwip_end(); }
             return;                      // wait for the scan to wind down
         }
         if (bt_link_busy()){
             if (memcmp(s_target_addr, s_connect_addr, 6) == 0){
                 s_connect_pending = false;       // already connecting/connected to it
             } else {
+                if (s_redirect_start_ms == 0) s_redirect_start_ms = to_ms_since_boot(get_absolute_time()) | 1;
+                if (to_ms_since_boot(get_absolute_time()) - s_redirect_start_ms > 5000){
+                    // Old link never released: give up waiting, force-clear.
+                    s_connecting = false; s_a2dp_connected = false;
+                    s_last_status = BT_ERR_BUSY;
+                    s_redirect_start_ms = 0;
+                    return;
+                }
                 bt_do_disconnect();
                 return;                  // wait for the old link to release
             }
         } else {
             s_connect_pending = false;
+            s_redirect_start_ms = 0;
             memcpy(device_addr, s_connect_addr, 6);
             memcpy(s_target_addr, s_connect_addr, 6);
             s_connecting = true;
             s_last_status = BT_ERR_NONE;
+            cyw43_arch_lwip_begin();
             uint8_t st = a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+            cyw43_arch_lwip_end();
             if (st != ERROR_CODE_SUCCESS){
                 s_connecting = false;
                 s_last_status = st;
@@ -900,7 +921,7 @@ static void bt_service_commands(void){
         s_scan_pending = false;
         if (!s_scan_req){
             s_scan_abort = true;
-            if (s_inquiry_active) gap_inquiry_stop();
+            if (s_inquiry_active){ cyw43_arch_lwip_begin(); gap_inquiry_stop(); cyw43_arch_lwip_end(); }
         } else if (s_bt_enabled || bt_link_busy()){
             // Inquiry steals radio time slots from an active link: never while streaming.
             s_last_status = BT_ERR_BUSY;
@@ -911,7 +932,9 @@ static void bt_service_commands(void){
             s_scanning = true;
             s_inquiry_active = true;
             s_last_status = BT_ERR_NONE;
+            cyw43_arch_lwip_begin();
             uint8_t st = (uint8_t)gap_inquiry_start(BT_INQUIRY_UNITS);
+            cyw43_arch_lwip_end();
             if (st != ERROR_CODE_SUCCESS){
                 s_scanning = false; s_inquiry_active = false; s_last_status = st;
             }
@@ -1017,7 +1040,9 @@ void bt_output_poll(void){
     // Power on — the background async context drives everything from here,
     // including the auto-connect on HCI_STATE_WORKING.
     s_radio_ok = true;
+    cyw43_arch_lwip_begin();
     hci_power_control(HCI_POWER_ON);
+    cyw43_arch_lwip_end();
     printf("[bt] A2DP source init done, sink=%s\n", device_addr_string);
 }
 
