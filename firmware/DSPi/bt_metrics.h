@@ -15,6 +15,12 @@
  *       because the BT FIFO was full (the A2DP consumer fell behind).
  *   fifo_underflow_frames   — stereo frames the A2DP media timer needed but the
  *       FIFO could not supply (the producer fell behind / stream outran input).
+ *   fifo_fill_frames        — FIFO fill (stereo frames) seen at the last media
+ *       pop; with drift handling it should hover around BT_FIFO_DRIFT_TARGET.
+ *   fifo_drift_skip_frames  — frames discarded by clock-drift handling (fill
+ *       above the high threshold: producer clock faster than the sink's).
+ *   fifo_drift_dup_frames   — frames repeated by clock-drift handling (fill
+ *       below the low threshold: sink clock faster than the producer's).
  *   sbc_encode_us_last      — duration of the most recent SBC encode pass (µs).
  *   sbc_encode_us_max       — largest SBC encode duration observed since boot
  *       (µs); the headroom indicator for the Core-0 budget.
@@ -29,6 +35,9 @@ typedef struct {
     uint32_t audio_callback_overruns;
     uint32_t fifo_overflow_frames;
     uint32_t fifo_underflow_frames;
+    uint32_t fifo_fill_frames;
+    uint32_t fifo_drift_skip_frames;
+    uint32_t fifo_drift_dup_frames;
     uint32_t sbc_encode_us_last;
     uint32_t sbc_encode_us_max;
 } BtMetrics;

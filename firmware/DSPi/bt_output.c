@@ -77,7 +77,7 @@ void __not_in_flash_func(bt_fifo_push)(const float *l, const float *r, uint32_t 
 }
 
 uint32_t bt_fifo_pop(int16_t *interleaved, uint32_t n_frames) {
-    return bt_fifo_pop_n(&s_fifo, interleaved, n_frames);
+    return bt_fifo_pop_drift(&s_fifo, interleaved, n_frames);
 }
 
 void bt_fifo_reset(void) {
@@ -89,6 +89,9 @@ BtMetrics bt_output_metrics(void) {
     m.audio_callback_overruns = spdif_overruns;
     m.fifo_overflow_frames    = s_fifo.overflow_frames;
     m.fifo_underflow_frames   = s_fifo.underflow_frames;
+    m.fifo_fill_frames        = s_fifo.drift_fill;
+    m.fifo_drift_skip_frames  = s_fifo.drift_skipped_frames;
+    m.fifo_drift_dup_frames   = s_fifo.drift_duplicated_frames;
     m.sbc_encode_us_last      = s_sbc_encode_us_last;
     m.sbc_encode_us_max       = s_sbc_encode_us_max;
     return m;
@@ -566,10 +569,12 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 static void stats_timeout_handler(btstack_timer_source_t * ts){
     BtMetrics m = bt_output_metrics();
     printf("[btm] en=%d acb_ovr=%" PRIu32 " fifo_of=%" PRIu32 " fifo_uf=%" PRIu32
-           " sbc_us_last=%" PRIu32 " sbc_us_max=%" PRIu32 " avail=%" PRIu32 "\n",
+           " sbc_us_last=%" PRIu32 " sbc_us_max=%" PRIu32 " avail=%" PRIu32
+           " fill=%" PRIu32 " skip=%" PRIu32 " dup=%" PRIu32 "\n",
            (int)s_bt_enabled, m.audio_callback_overruns, m.fifo_overflow_frames,
            m.fifo_underflow_frames, m.sbc_encode_us_last, m.sbc_encode_us_max,
-           bt_fifo_available(&s_fifo));
+           bt_fifo_available(&s_fifo), m.fifo_fill_frames,
+           m.fifo_drift_skip_frames, m.fifo_drift_dup_frames);
     btstack_run_loop_set_timer(ts, 1000);
     btstack_run_loop_add_timer(ts);
 }

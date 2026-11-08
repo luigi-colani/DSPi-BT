@@ -69,7 +69,34 @@ typedef struct {
     volatile uint32_t overflow_frames;   // frames dropped on a full ring
     volatile uint32_t underflow_frames;  // frames the consumer asked for but
                                          // the ring could not supply
+    // Clock-drift state — written by the consumer only (bt_fifo_pop_drift).
+    volatile uint32_t drift_skipped_frames;     // frames discarded (fill high)
+    volatile uint32_t drift_duplicated_frames;  // frames repeated (fill low)
+    volatile uint32_t drift_fill;               // fill seen at the last pop
+    volatile uint8_t  drift_mode;               // BT_FIFO_DRIFT_{IDLE,DUP,SKIP}
 } bt_fifo_t;
+
+// ---------------------------------------------------------------------------
+// Clock-drift policy (consumer side).  The producer (DSPi sample clock) and
+// the consumer (BTstack media timer / sink clock) run at slightly different
+// rates, so fill slowly walks toward empty or full.  The consumer keeps it
+// bounded by repeating (fill low) or discarding (fill high) ONE whole stereo
+// frame per pop block — at the PCM frame boundary, before SBC encoding, so
+// the SBC stream is never touched.  Max correction is 1 frame per block
+// (~7800 ppm for a 128-frame block), far above crystal-class drift.
+//
+// Hysteresis: a correction mode engages past LOW/HIGH and only releases once
+// fill is back inside the LOW_EXIT/HIGH_EXIT band, so it cannot thrash near a
+// threshold.  The band sits around TARGET (~21 ms @ 48 kHz); the media timer
+// should prefill to TARGET before the first pop.
+// ---------------------------------------------------------------------------
+#define BT_FIFO_DRIFT_TARGET     1024u
+#define BT_FIFO_DRIFT_LOW         512u   // enter DUP below this
+#define BT_FIFO_DRIFT_LOW_EXIT    768u   // leave DUP at/above this
+#define BT_FIFO_DRIFT_HIGH       2048u   // enter SKIP above this
+#define BT_FIFO_DRIFT_HIGH_EXIT  1536u   // leave SKIP at/below this
+
+enum { BT_FIFO_DRIFT_IDLE = 0, BT_FIFO_DRIFT_DUP = 1, BT_FIFO_DRIFT_SKIP = 2 };
 
 // ---------------------------------------------------------------------------
 // Core ring primitives (header-only, host-testable)
@@ -80,6 +107,15 @@ static inline void bt_fifo_init(bt_fifo_t *f) {
     f->tail = 0;
     f->overflow_frames = 0;
     f->underflow_frames = 0;
+    f->drift_skipped_frames = 0;
+    f->drift_duplicated_frames = 0;
+    f->drift_fill = 0;
+    f->drift_mode = BT_FIFO_DRIFT_IDLE;
+}
+
+// Reset drift state only (ring and counters untouched).
+static inline void bt_fifo_drift_init(bt_fifo_t *f) {
+    f->drift_mode = BT_FIFO_DRIFT_IDLE;
 }
 
 // Frames currently available to pop.
@@ -167,12 +203,54 @@ static inline uint32_t bt_fifo_pop_n(bt_fifo_t *f,
     return count;
 }
 
+// Consumer: like bt_fifo_pop_n, but applies the clock-drift policy above.
+// Always delivers the same number of output frames as a plain pop would
+// (n, unless the ring genuinely underflows), so the caller's framing is
+// unchanged.  Non-blocking, O(n), consumer-context only.
+//   DUP : pops n-1 frames and repeats the last one to fill the block.
+//   SKIP: discards the oldest pending frame, then pops n.
+static inline uint32_t bt_fifo_pop_drift(bt_fifo_t *f,
+                                         int16_t *interleaved,
+                                         uint32_t n) {
+    uint32_t avail = bt_fifo_available(f);
+    f->drift_fill = avail;
+
+    uint8_t mode = f->drift_mode;
+    if (mode == BT_FIFO_DRIFT_DUP) {
+        if (avail >= BT_FIFO_DRIFT_LOW_EXIT) mode = BT_FIFO_DRIFT_IDLE;
+    } else if (mode == BT_FIFO_DRIFT_SKIP) {
+        if (avail <= BT_FIFO_DRIFT_HIGH_EXIT) mode = BT_FIFO_DRIFT_IDLE;
+    }
+    if (mode == BT_FIFO_DRIFT_IDLE) {
+        if (avail < BT_FIFO_DRIFT_LOW)       mode = BT_FIFO_DRIFT_DUP;
+        else if (avail > BT_FIFO_DRIFT_HIGH) mode = BT_FIFO_DRIFT_SKIP;
+    }
+    f->drift_mode = mode;
+
+    if (mode == BT_FIFO_DRIFT_SKIP && avail > n) {
+        // Drop the oldest frame unread (tail is consumer-owned).
+        __dmb();
+        f->tail = (f->tail + 1) & BT_FIFO_MASK;
+        f->drift_skipped_frames++;
+    } else if (mode == BT_FIFO_DRIFT_DUP && n >= 2 && avail >= 1) {
+        uint32_t got = bt_fifo_pop_n(f, interleaved, n - 1);
+        if (got == n - 1) {
+            interleaved[(n - 1) * 2]     = interleaved[(n - 2) * 2];
+            interleaved[(n - 1) * 2 + 1] = interleaved[(n - 2) * 2 + 1];
+            f->drift_duplicated_frames++;
+            return n;
+        }
+        return got;   // genuine underflow; caller pads silence
+    }
+    return bt_fifo_pop_n(f, interleaved, n);
+}
+
 // ---------------------------------------------------------------------------
 // Global-instance API (defined in bt_output.c; see file header)
 // ---------------------------------------------------------------------------
 #if DSPI_BT
 void     bt_fifo_push(const float *l, const float *r, uint32_t n);
-uint32_t bt_fifo_pop(int16_t *interleaved, uint32_t n_frames);
+uint32_t bt_fifo_pop(int16_t *interleaved, uint32_t n_frames);  // applies drift policy
 void     bt_fifo_reset(void);
 #endif
 

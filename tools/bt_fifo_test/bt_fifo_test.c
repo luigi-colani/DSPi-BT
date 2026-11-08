@@ -206,6 +206,167 @@ static void test_wraparound(void) {
     CHECK_EQ_U(fifo.underflow_frames, 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// Clock-drift scenarios: producer at fp Hz pushing PUSH_CHUNK-frame bursts,
+// consumer at fc Hz popping POP_CHUNK-frame blocks (event-driven, two clocks).
+// ---------------------------------------------------------------------------
+#define PUSH_CHUNK 48u    // ~1 ms pipeline push at 48 kHz
+#define POP_CHUNK  128u   // SBC block
+
+typedef struct {
+    uint32_t min_fill, max_fill;
+    uint32_t underflow, overflow;
+    uint32_t skipped, duplicated;
+    int      framing_ok;   // every output frame advanced the ramp by 0, 1 or 2
+    int      lr_ok;        // R channel always == -L
+} drift_result_t;
+
+static drift_result_t run_drift(double fp, double fc, double seconds,
+                                int use_drift, uint32_t prefill) {
+    drift_result_t res = { UINT32_MAX, 0, 0, 0, 0, 0, 1, 1 };
+    bt_fifo_init(&fifo);
+    bt_fifo_drift_init(&fifo);
+
+    static float l[PUSH_CHUNK], r[PUSH_CHUNK];
+    static int16_t out[POP_CHUNK * 2];
+    uint32_t seq = 0;                    // producer ramp counter
+    const uint32_t WRAP = 30000;
+
+    // Prefill to the target level (what the media timer's startup does).
+    for (uint32_t done = 0; done < prefill; ) {
+        uint32_t n = (prefill - done < PUSH_CHUNK) ? prefill - done : PUSH_CHUNK;
+        for (uint32_t i = 0; i < n; i++) {
+            l[i] = ((float)(seq % WRAP) + 0.5f) / 32767.0f; r[i] = -l[i]; seq++;
+        }
+        bt_fifo_push_n(&fifo, l, r, n);
+        done += n;
+    }
+
+    double tp = 0.0, tc = 0.0;
+    const double dp = PUSH_CHUNK / fp, dc = POP_CHUNK / fc;
+    int have_prev = 0; int prev = 0;
+    while (tp < seconds && tc < seconds) {
+        if (tp <= tc) {
+            for (uint32_t i = 0; i < PUSH_CHUNK; i++) {
+                l[i] = ((float)(seq % WRAP) + 0.5f) / 32767.0f; r[i] = -l[i]; seq++;
+            }
+            bt_fifo_push_n(&fifo, l, r, PUSH_CHUNK);
+            tp += dp;
+        } else {
+            uint32_t got = use_drift ? bt_fifo_pop_drift(&fifo, out, POP_CHUNK)
+                                     : bt_fifo_pop_n(&fifo, out, POP_CHUNK);
+            for (uint32_t i = 0; i < got; i++) {
+                int v = out[i * 2];
+                if (out[i * 2 + 1] != -v) res.lr_ok = 0;
+                if (have_prev) {
+                    int d = ((v - prev) % (int)WRAP + (int)WRAP) % (int)WRAP;
+                    if (d > 2) res.framing_ok = 0;
+                }
+                prev = v; have_prev = 1;
+            }
+            uint32_t fill = bt_fifo_available(&fifo);
+            if (fill < res.min_fill) res.min_fill = fill;
+            if (fill > res.max_fill) res.max_fill = fill;
+            tc += dc;
+        }
+    }
+    res.underflow  = fifo.underflow_frames;
+    res.overflow   = fifo.overflow_frames;
+    res.skipped    = fifo.drift_skipped_frames;
+    res.duplicated = fifo.drift_duplicated_frames;
+    return res;
+}
+
+static void report(const char *n, drift_result_t r) {
+    printf("  %-28s fill[%u..%u] uf=%u of=%u skip=%u dup=%u\n", n,
+           r.min_fill, r.max_fill, r.underflow, r.overflow, r.skipped, r.duplicated);
+}
+
+static void test_drift_baseline_fails(void) {
+    printf("test_drift_baseline_fails (no correction drifts out of bounds)\n");
+    // Consumer 500 ppm fast: plain pop underflows over 10 min.
+    drift_result_t a = run_drift(48000.0, 48000.0 * 1.0005, 600, 0, 1024);
+    report("plain, consumer fast", a);
+    CHECK(a.underflow > 0);
+    // Producer 500 ppm fast: plain pop overflows.
+    drift_result_t b = run_drift(48000.0 * 1.0005, 48000.0, 600, 0, 1024);
+    report("plain, producer fast", b);
+    CHECK(b.overflow > 0);
+}
+
+static void check_bounded(const char *name, double fp, double fc, double secs) {
+    drift_result_t r = run_drift(fp, fc, secs, 1, BT_FIFO_DRIFT_TARGET);
+    report(name, r);
+    CHECK_EQ_U(r.underflow, 0);
+    CHECK_EQ_U(r.overflow, 0);
+    // Bounded: stays inside [LOW - one block, HIGH + one block].
+    CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK >= BT_FIFO_DRIFT_LOW);  // sampled post-pop
+    CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK);
+    CHECK(r.framing_ok);
+    CHECK(r.lr_ok);
+}
+
+static void test_drift_consumer_faster(void) {
+    printf("test_drift_consumer_faster (30 min, +500 ppm)\n");
+    check_bounded("consumer +500ppm", 48000.0, 48000.0 * 1.0005, 1800);
+    drift_result_t r = run_drift(48000.0, 48000.0 * 1.0005, 1800, 1, BT_FIFO_DRIFT_TARGET);
+    CHECK(r.duplicated > 0);
+    CHECK_EQ_U(r.skipped, 0);
+}
+
+static void test_drift_producer_faster(void) {
+    printf("test_drift_producer_faster (30 min, +500 ppm)\n");
+    check_bounded("producer +500ppm", 48000.0 * 1.0005, 48000.0, 1800);
+    drift_result_t r = run_drift(48000.0 * 1.0005, 48000.0, 1800, 1, BT_FIFO_DRIFT_TARGET);
+    CHECK(r.skipped > 0);
+    CHECK_EQ_U(r.duplicated, 0);
+}
+
+static void test_drift_44k1_and_large(void) {
+    printf("test_drift_44k1_and_large (44.1 kHz, +/-2000 ppm)\n");
+    check_bounded("44.1k consumer +2000ppm", 44100.0, 44100.0 * 1.002, 600);
+    check_bounded("44.1k producer +2000ppm", 44100.0 * 1.002, 44100.0, 600);
+}
+
+static void test_drift_no_drift_is_quiet(void) {
+    printf("test_drift_no_drift_is_quiet (matched clocks: no corrections)\n");
+    drift_result_t r = run_drift(48000.0, 48000.0, 600, 1, BT_FIFO_DRIFT_TARGET);
+    report("matched", r);
+    CHECK_EQ_U(r.underflow, 0);
+    CHECK_EQ_U(r.skipped, 0);
+    CHECK_EQ_U(r.duplicated, 0);
+}
+
+static void test_drift_hysteresis(void) {
+    printf("test_drift_hysteresis (no thrash near a threshold)\n");
+    // Park fill just under LOW with matched clocks: dup mode engages once and
+    // holds until fill recovers past LOW_EXIT; corrections are one frame per
+    // pop, so recovery takes ~(LOW_EXIT-LOW) pops, not alternating each pop.
+    bt_fifo_init(&fifo);
+    bt_fifo_drift_init(&fifo);
+    static float l[POP_CHUNK], r[POP_CHUNK];
+    static int16_t out[POP_CHUNK * 2];
+    for (uint32_t i = 0; i < POP_CHUNK; i++) { l[i] = 0.1f; r[i] = -0.1f; }
+    uint32_t target = BT_FIFO_DRIFT_LOW - 1;
+    while (bt_fifo_available(&fifo) < target) bt_fifo_push_n(&fifo, l, r, 1);
+    uint32_t dups_seen = 0, transitions = 0, prev_dup = 0;
+    for (int k = 0; k < 400; k++) {
+        uint32_t before = fifo.drift_duplicated_frames;
+        bt_fifo_pop_drift(&fifo, out, POP_CHUNK);
+        bt_fifo_push_n(&fifo, l, r, POP_CHUNK);       // matched clocks
+        uint32_t d = fifo.drift_duplicated_frames - before;
+        dups_seen += d;
+        if (d != prev_dup) transitions++;
+        prev_dup = d;
+    }
+    printf("  dups=%u transitions=%u final_fill=%u\n", dups_seen, transitions,
+           bt_fifo_available(&fifo));
+    CHECK(transitions <= 2);                          // on once, off once
+    CHECK(dups_seen >= BT_FIFO_DRIFT_LOW_EXIT - BT_FIFO_DRIFT_LOW);
+    CHECK(bt_fifo_available(&fifo) >= BT_FIFO_DRIFT_LOW_EXIT);
+}
+
 int main(void) {
     printf("=== bt_fifo host test ===\n");
     test_init_empty();
@@ -214,6 +375,12 @@ int main(void) {
     test_overflow();
     test_partial_push_on_near_full();
     test_wraparound();
+    test_drift_baseline_fails();
+    test_drift_consumer_faster();
+    test_drift_producer_faster();
+    test_drift_44k1_and_large();
+    test_drift_no_drift_is_quiet();
+    test_drift_hysteresis();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     if (failures) {
