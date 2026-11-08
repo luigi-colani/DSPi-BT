@@ -98,7 +98,7 @@ static inline uint32_t bt_output_apply_rate_policy(uint32_t requested) {
 }
 static inline bool bt_output_rate_allowed(uint32_t requested) {
 #if DSPI_BT
-    return bt_rate_allowed(requested, bt_output_is_enabled());
+    return bt_rate_allowed(requested, bt_output_is_enabled(), bt_output_sink_rate());
 #else
     (void)requested;
     return true;

@@ -2783,8 +2783,10 @@ int main(void) {
                     __dmb();
                     rate_change_pending = true;
                 }
+                // Latch the edge only here (no change was pending), so a
+                // BT-stop while a rate change is pending is not lost.
+                bt_prev_active = bt_now;
             }
-            bt_prev_active = bt_now;
         }
 #endif
         if (rate_change_pending && pipeline_reset_ready()) {

@@ -15,10 +15,16 @@ static inline uint32_t bt_rate_sink_or_default(uint32_t sink_rate) {
     return (sink_rate == 44100u || sink_rate == 48000u) ? sink_rate : BT_RATE_SBC_DEFAULT;
 }
 
-// Is `requested` acceptable as a host/source-selected rate?  False only for
-// rates SBC cannot carry (anything above 48 kHz) while BT is active.
-static inline bool bt_rate_allowed(uint32_t requested, bool bt_active) {
-    return !bt_active || requested <= 48000u;
+// Is `requested` acceptable as a USB host-selected rate?  While BT is active
+// only the sink's SBC rate is: any other rate (incl. 96 kHz) would either be
+// uncarryable or silently pitch-shift host content, so the host is stalled and
+// falls back to the sink rate (its mixer resamples).  Non-USB inputs are still
+// pinned via bt_rate_clamp (unavoidable pitch shift without a resampler).
+// Note: if BT starts while the host already streams at another rate (e.g.
+// 96k), the pipeline pins to the sink rate and the host keeps sending until its
+// next SET_CUR; the stall only blocks new requests.
+static inline bool bt_rate_allowed(uint32_t requested, bool bt_active, uint32_t sink_rate) {
+    return !bt_active || requested == bt_rate_sink_or_default(sink_rate);
 }
 
 // Rate the pipeline may actually run at.
