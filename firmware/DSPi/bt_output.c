@@ -607,6 +607,14 @@ void bt_output_poll(void){
 
     s_bringup_done = true;
 
+    // Resource mutual-exclusion MUST run before cyw43_arch_init(): stand down
+    // the PIO1-resident wired outputs (PDM sub, ADAT bulk) so the radio can
+    // claim a free PIO state machine + DMA pair + its GPIOs.  Reports which
+    // outputs it disabled so the budget/measurement log can account for them.
+    uint8_t stood_down = 0;
+    bt_output_enable(true, &stood_down);
+    printf("[bt] output stand-down mask=0x%02x (bit0=PDM bit1=ADAT)\n", stood_down);
+
     printf("[bt] cyw43_arch_init...\n");
     if (cyw43_arch_init()){
         printf("[bt] cyw43_arch_init FAILED\n");
@@ -641,6 +649,10 @@ bool __not_in_flash_func(bt_output_is_enabled)(void){
 void bt_output_led(bool on){
     if (!s_cyw43_ready) return;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
+}
+
+bool bt_radio_resources_held(void){
+    return s_cyw43_ready;
 }
 
 #endif // DSPI_BT

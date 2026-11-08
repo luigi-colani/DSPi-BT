@@ -46,6 +46,8 @@
 #include "adat_input.h"
 #include "input_source_names.h"
 #include "loopback.h"   // DSPI_LOOPBACK glitch counters (self-guarded; empty otherwise)
+#include "bt_exclusion.h"  // gpio_reserved_for_radio() + stand-down resolution
+#include "bt_output.h"     // bt_radio_resources_held() (DSPI_BT only)
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "pico/audio_spdif.h"
@@ -372,12 +374,101 @@ bool is_valid_gpio_pin(uint8_t pin) {
     // GPIO 16/17 are general-purpose again since the debug UART was removed;
     // when the UART control interface claims them, is_pin_in_use() covers it.
     if (pin >= 23 && pin <= 25) return false;   // Power/LED
+#if DSPI_BT
+    // Pico 2 W: the CYW43 radio owns GPIO 23/24/25/29.  23-25 are already
+    // rejected above; this additionally reserves 29 (VSYS ADC / WL_CLK) so no
+    // output, clock, or RX pin-config can land on a pad the radio is driving.
+    if (gpio_reserved_for_radio(pin)) return false;
+#endif
 #if PICO_RP2350
     return pin <= 29;
 #else
     return pin <= 28;
 #endif
 }
+
+#if DSPI_BT
+// ----------------------------------------------------------------------------
+// Bluetooth radio resource mutual-exclusion (Task 3)
+// ----------------------------------------------------------------------------
+// Stand down the PIO1-resident wired outputs (PDM sub, ADAT bulk) when BT is
+// enabled so the CYW43 radio's cyw43_arch_init() can claim a free PIO state
+// machine + DMA pair, and restore them when BT is disabled.  See bt_exclusion.h
+// for the grounding against the PIO/DMA map.  The stand-down uses the SAME safe
+// machinery the host-facing handlers use — the matrix enable flag + the
+// PDM<->EQ-worker Core-1 transition for the PDM sub, and the deferred,
+// mute-bracketed ADAT config apply for the ADAT bulk output — so the still-active
+// S/PDIF mains (which feed the BT stream) are never disturbed and never click.
+
+// Which PIO1 wired outputs the last bt_output_enable(true) disabled, so a later
+// bt_output_enable(false) re-enables exactly those.
+static uint8_t s_bt_standdown_mask = 0;
+
+static void bt_pdm_set_output_enabled(bool en) {
+    uint8_t pdm = NUM_OUTPUT_CHANNELS - 1;
+    matrix_mixer.outputs[pdm].enabled = en ? 1 : 0;
+    Core1Mode new_mode = derive_core1_mode();
+    if (new_mode != core1_mode) {
+        core1_mode = new_mode;
+#if ENABLE_SUB
+        pdm_set_enabled(new_mode == CORE1_MODE_PDM);
+#endif
+        __sev();   // Wake Core 1 to pick up the mode change
+    }
+    uint8_t v = en ? 1 : 0;
+    notify_param_write((uint16_t)(offsetof(WireBulkParams, outputs)
+        + (uint16_t)pdm * sizeof(WireOutputChannel)
+        + offsetof(WireOutputChannel, enabled)), 1, &v);
+}
+
+bool bt_output_enable(bool on, uint8_t *stood_down_mask) {
+    uint8_t mask;
+    if (on) {
+        bool pdm_active  = matrix_mixer.outputs[NUM_OUTPUT_CHANNELS - 1].enabled != 0;
+        bool adat_active = false;
+#if PICO_RP2350
+        adat_active = adat_output_config_enabled();
+#endif
+        mask = bt_output_standdown_resolve(pdm_active, adat_active);
+
+        if (mask & BT_STOODDOWN_PDM) {
+            bt_pdm_set_output_enabled(false);
+        }
+#if PICO_RP2350
+        if (mask & BT_STOODDOWN_ADAT) {
+            // Deferred, mute-bracketed teardown serviced by the main loop
+            // (adat_output_config_dirty); click-free per the ADAT spec.
+            adat_output_set_config(false, adat_output_pin());
+            uint8_t v = 0;
+            notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
+        }
+#endif
+        s_bt_standdown_mask = mask;
+    } else {
+        mask = s_bt_standdown_mask;
+
+        if (mask & BT_STOODDOWN_PDM) {
+            // Honour the PDM<->EQ-worker interlock: only restore the PDM sub if
+            // no Core-1 EQ output grabbed the slot while BT held it.
+            bool eq_busy = false;
+            for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++)
+                if (matrix_mixer.outputs[i].enabled) { eq_busy = true; break; }
+            if (!eq_busy) bt_pdm_set_output_enabled(true);
+            else          mask &= (uint8_t)~BT_STOODDOWN_PDM;  // left disabled
+        }
+#if PICO_RP2350
+        if (mask & BT_STOODDOWN_ADAT) {
+            adat_output_set_config(true, adat_output_pin());
+            uint8_t v = 1;
+            notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
+        }
+#endif
+        s_bt_standdown_mask = 0;
+    }
+    if (stood_down_mask) *stood_down_mask = mask;
+    return mask != 0;
+}
+#endif // DSPI_BT
 
 // Pin claimed by a "fixed" peripheral other than MCK (outputs, SPDIF RX, ADAT,
 // DAC mute, control pins).  Excludes the I2S clocks and RX data pins, whose
@@ -1243,6 +1334,13 @@ static bool vendor_handle_set_body(tusb_control_request_t const *req) {
                     bool is_pdm = (out == NUM_OUTPUT_CHANNELS - 1);
                     bool is_core1_eq = (out >= CORE1_EQ_FIRST_OUTPUT && out <= CORE1_EQ_LAST_OUTPUT);
 
+#if DSPI_BT
+                    // Radio interlock: while the CYW43 radio holds the PIO SM /
+                    // DMA freed by standing down the PDM sub, refuse to let the
+                    // host re-enable it (it would re-claim a PIO1 SM + DMA the
+                    // radio now owns).  Mirrors the PDM<->EQ-worker interlock.
+                    if (is_pdm && bt_radio_resources_held()) goto skip_enable;
+#endif
                     if (is_pdm) {
                         for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++) {
                             if (matrix_mixer.outputs[i].enabled) goto skip_enable;
@@ -3682,6 +3780,14 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
                     // Enabling from disabled: validate the configured ADAT pin.
                     // ADAT is not yet config-enabled, so it never blocks itself.
                     uint8_t pin = adat_output_pin();
+#if DSPI_BT
+                    // Radio interlock: the ADAT bulk output was stood down (and
+                    // its PIO1 SM1 + DMA 13/14 freed) so the CYW43 radio could
+                    // claim them.  Refuse to re-enable while the radio holds them.
+                    if (bt_radio_resources_held()) {
+                        status = PIN_CONFIG_OUTPUT_ACTIVE;
+                    } else
+#endif
                     if (!is_valid_gpio_pin(pin)) {
                         status = PIN_CONFIG_INVALID_PIN;
                     } else if (is_pin_in_use(pin, 0xFF)) {

@@ -2,6 +2,7 @@
 #define BT_OUTPUT_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #if DSPI_BT
 
@@ -23,6 +24,20 @@ bool bt_output_is_enabled(void);
 // radio is up (no-op until cyw43_arch_init() has run).  Used for the boot
 // heartbeat since GPIO 25 is the radio chip-select on a 2 W.
 void bt_output_led(bool on);
+
+// True once cyw43_arch_init() has succeeded and the radio owns its claimed PIO
+// state machine + DMA channels + GPIO 23/24/25/29.  While true, the vendor
+// handlers refuse to re-enable the wired outputs that were stood down to free
+// those resources (the PDM sub, the ADAT bulk output).
+bool bt_radio_resources_held(void);
+
+// Resource mutual-exclusion (implemented in vendor_commands.c, where the output
+// matrix + PDM/ADAT teardown machinery live).  Stand down (on=true) or restore
+// (on=false) the PIO1-resident wired outputs that contend with the radio for a
+// PIO state machine + DMA, so cyw43_arch_init() can claim them.  Reports the set
+// it changed via *stood_down_mask (BT_STOODDOWN_* bits from bt_exclusion.h);
+// returns true iff anything changed.  Must run on Core 0, before the radio init.
+bool bt_output_enable(bool on, uint8_t *stood_down_mask);
 
 #endif // DSPI_BT
 
