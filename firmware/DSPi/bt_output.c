@@ -34,6 +34,7 @@
 
 #include "bt_fifo.h"
 #include "bt_metrics.h"
+#include "notify.h"
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -184,6 +185,55 @@ static uint32_t s_bringup_ticks = 0;
 
 // Periodic [btm] stats line.
 static btstack_timer_source_t stats_timer;
+
+// ---------------------------------------------------------------------------
+// Control-surface state (Task 5).  Pending flags are written by the vendor
+// handlers (EP0 context) and consumed by bt_output_poll() (main loop) — the
+// BTstack / radio calls never run in the control-transfer context.
+// ---------------------------------------------------------------------------
+#define BT_SCAN_MAX        12
+#define BT_INQUIRY_UNITS   6        // x1.28 s ~= 7.7 s
+
+typedef struct {
+    bd_addr_t addr;
+    int8_t    rssi;
+    uint8_t   flags;
+    uint32_t  cod;
+    uint8_t   psrm;
+    uint16_t  clock_offset;
+    char      name[BT_SCAN_NAME_LEN];
+} bt_scan_entry_t;
+
+static bt_scan_entry_t s_scan[BT_SCAN_MAX];
+static volatile uint8_t s_scan_count = 0;
+static uint8_t s_name_idx = 0;
+static volatile bool s_scan_abort = false;
+
+static volatile bool s_enable_pending = false;
+static volatile bool s_enable_req = true;
+static volatile bool s_scan_pending = false;
+static volatile bool s_scan_req = false;
+static volatile bool s_connect_pending = false;
+static bd_addr_t     s_connect_addr;
+static volatile bool s_disconnect_pending = false;
+static volatile bool s_forget_pending = false;
+static bd_addr_t     s_forget_addr;
+
+static bool s_user_enabled  = true;   // BT on at boot (Task 2-4 behaviour)
+static bool s_user_directed = false;  // a command has steered the link: suppress the
+                                      // BT_TEST_SINK_ADDR boot auto-connect fallback
+static bool s_radio_ok      = false;  // bring-up fully succeeded
+static volatile bool s_hci_working = false;
+static volatile bool s_inquiry_active = false;  // inquiry running
+static volatile bool s_scanning = false;        // inquiry + name resolution
+static volatile bool s_connecting = false;
+static volatile bool s_a2dp_connected = false;
+static volatile uint8_t s_codec = BT_CODEC_NONE;
+static bd_addr_t s_target_addr;
+static volatile uint8_t s_last_status = BT_ERR_NONE;
+
+static bool    s_notify_valid = false;
+static uint8_t s_notify_last[BT_NOTIFY_PAYLOAD_SIZE];
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -374,6 +424,65 @@ static void dump_sbc_configuration(media_codec_configuration_sbc_t * c){
            c->subbands, c->allocation_method, c->min_bitpool_value, c->max_bitpool_value);
 }
 
+static uint8_t bt_compute_state(void){
+    if (!s_user_enabled || !s_hci_working) return BT_STATE_OFF;
+    if (s_bt_enabled)                      return BT_STATE_STREAMING;
+    if (s_a2dp_connected)                  return BT_STATE_CONNECTED;
+    if (s_connecting)                      return BT_STATE_CONNECTING;
+    if (s_scanning)                        return BT_STATE_SCANNING;
+    return BT_STATE_IDLE;
+}
+
+void bt_get_status(BtStatus *out){
+    memset(out, 0, sizeof *out);
+    out->state = bt_compute_state();
+    out->flags = (s_user_enabled ? BT_STAT_FLAG_ENABLED : 0)
+               | (s_scanning     ? BT_STAT_FLAG_SCANNING : 0)
+               | (s_hci_working  ? BT_STAT_FLAG_RADIO_UP : 0);
+    out->codec = s_codec;
+    out->volume = media_tracker.volume;
+    memcpy(out->addr, s_target_addr, 6);
+    out->sample_rate = s_codec ? (uint32_t)current_sample_rate : 0;
+    out->scan_count = s_scan_count;
+    out->last_status = s_last_status;
+}
+
+bool bt_get_scan_result(uint8_t index, BtScanResult *out){
+    if (index >= s_scan_count) return false;
+    const bt_scan_entry_t *e = &s_scan[index];
+    memset(out, 0, sizeof *out);
+    memcpy(out->addr, e->addr, 6);
+    out->rssi = e->rssi; out->flags = e->flags; out->cod = e->cod;
+    out->index = index; out->count = s_scan_count;
+    memcpy(out->name, e->name, BT_SCAN_NAME_LEN);
+    out->name[BT_SCAN_NAME_LEN - 1] = 0;
+    return true;
+}
+
+static bool bt_is_bonded(const bd_addr_t addr){
+    btstack_link_key_iterator_t it;
+    if (!gap_link_key_iterator_init(&it)) return false;
+    bd_addr_t a; link_key_t k; link_key_type_t t;
+    bool found = false;
+    while (!found && gap_link_key_iterator_get_next(&it, a, k, &t)){
+        if (memcmp(a, addr, 6) == 0) found = true;
+    }
+    gap_link_key_iterator_done(&it);
+    return found;
+}
+
+// Resolve the next unnamed scan entry (or finish the scan).
+static void bt_scan_next_name(void){
+    while (s_name_idx < s_scan_count){
+        bt_scan_entry_t *e = &s_scan[s_name_idx];
+        if (!(e->flags & BT_SCAN_FLAG_NAMED)){
+            if (gap_remote_name_request(e->addr, e->psrm, (uint16_t)(e->clock_offset | 0x8000)) == 0) return;
+        }
+        s_name_idx++;
+    }
+    s_scanning = false;
+}
+
 // ---------------------------------------------------------------------------
 // HCI events — auto-connect to the fixed sink once the controller is working.
 // ---------------------------------------------------------------------------
@@ -384,13 +493,74 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 
     switch (hci_event_packet_get_type(packet)){
         case BTSTACK_EVENT_STATE:
-            if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) break;
-            printf("[bt] HCI working, connecting to sink %s...\n", device_addr_string);
-            a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+            if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING){
+                if (btstack_event_state_get_state(packet) == HCI_STATE_OFF) s_hci_working = false;
+                break;
+            }
+            s_hci_working = true;
+            // Boot-time measurement fallback: auto-connect to the fixed test sink
+            // ONLY while no vendor command has directed the link.
+            if (!s_user_directed){
+                printf("[bt] HCI working, connecting to sink %s...\n", device_addr_string);
+                s_connecting = true;
+                memcpy(s_target_addr, device_addr, 6);
+                a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+            } else {
+                printf("[bt] HCI working (awaiting vendor-command connect)\n");
+            }
             break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             hci_event_pin_code_request_get_bd_addr(packet, address);
             gap_pin_code_response(address, "0000");
+            break;
+
+        case GAP_EVENT_INQUIRY_RESULT: {
+            gap_event_inquiry_result_get_bd_addr(packet, address);
+            uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
+            if (((cod >> 8) & 0x1F) != 0x04) break;          // Audio/Video major class only
+            uint8_t i;
+            for (i = 0; i < s_scan_count; i++) if (memcmp(s_scan[i].addr, address, 6) == 0) break;
+            if (i == s_scan_count){
+                if (s_scan_count >= BT_SCAN_MAX) break;
+                memset(&s_scan[i], 0, sizeof s_scan[i]);
+                memcpy(s_scan[i].addr, address, 6);
+                s_scan_count = (uint8_t)(i + 1);
+            }
+            bt_scan_entry_t *e = &s_scan[i];
+            e->cod = cod;
+            e->flags |= BT_SCAN_FLAG_AUDIO;
+            if (bt_is_bonded(address)) e->flags |= BT_SCAN_FLAG_BONDED;
+            e->psrm = gap_event_inquiry_result_get_page_scan_repetition_mode(packet);
+            e->clock_offset = gap_event_inquiry_result_get_clock_offset(packet);
+            if (gap_event_inquiry_result_get_rssi_available(packet))
+                e->rssi = (int8_t)gap_event_inquiry_result_get_rssi(packet);
+            if (gap_event_inquiry_result_get_name_available(packet)){
+                uint8_t n = gap_event_inquiry_result_get_name_len(packet);
+                if (n > BT_SCAN_NAME_LEN - 1) n = BT_SCAN_NAME_LEN - 1;
+                memcpy(e->name, gap_event_inquiry_result_get_name(packet), n);
+                e->name[n] = 0;
+                e->flags |= BT_SCAN_FLAG_NAMED;
+            }
+            break;
+        }
+        case GAP_EVENT_INQUIRY_COMPLETE:
+            s_inquiry_active = false;
+            s_name_idx = 0;
+            if (s_scan_abort){ s_scanning = false; break; }
+            bt_scan_next_name();
+            break;
+        case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE:
+            if (s_scanning && s_name_idx < s_scan_count){
+                bt_scan_entry_t *e = &s_scan[s_name_idx];
+                if (hci_event_remote_name_request_complete_get_status(packet) == 0){
+                    strncpy(e->name, hci_event_remote_name_request_complete_get_remote_name(packet),
+                            BT_SCAN_NAME_LEN - 1);
+                    e->name[BT_SCAN_NAME_LEN - 1] = 0;
+                }
+                e->flags |= BT_SCAN_FLAG_NAMED;      // resolved (or gave up)
+                s_name_idx++;
+                if (s_scan_abort) s_scanning = false; else bt_scan_next_name();
+            }
             break;
         default:
             break;
@@ -414,11 +584,16 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             a2dp_subevent_signaling_connection_established_get_bd_addr(packet, address);
             cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
             status = a2dp_subevent_signaling_connection_established_get_status(packet);
+            s_connecting = false;
             if (status != ERROR_CODE_SUCCESS){
                 printf("[bt] A2DP connection failed, status 0x%02x\n", status);
                 media_tracker.a2dp_cid = 0;
+                s_last_status = status;
                 break;
             }
+            s_last_status = BT_ERR_NONE;
+            s_a2dp_connected = true;
+            memcpy(s_target_addr, address, 6);
             media_tracker.a2dp_cid = cid;
             media_tracker.volume = 32;
             printf("[bt] A2DP connected to %s, cid 0x%02x\n", bd_addr_to_str(address), cid);
@@ -450,6 +625,7 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             dump_sbc_configuration(&sbc_configuration);
 
             current_sample_rate = sbc_configuration.sampling_frequency;
+            s_codec = BT_CODEC_SBC;
             sbc_encoder_instance = btstack_sbc_encoder_bluedroid_init_instance(&sbc_encoder_state);
             sbc_encoder_instance->configure(&sbc_encoder_state, SBC_MODE_STANDARD,
                                             sbc_configuration.block_length, sbc_configuration.subbands,
@@ -505,6 +681,9 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
                 media_tracker.avrcp_cid = 0;
                 media_tracker.a2dp_cid = 0;
             }
+            s_a2dp_connected = false;
+            s_connecting = false;
+            s_codec = BT_CODEC_NONE;
             printf("[bt] A2DP signaling released\n");
             break;
 
@@ -558,6 +737,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
     if (!media_tracker.avrcp_cid) return;
     if (packet[2] == AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED){
+        media_tracker.volume = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
         printf("[bt] AVRCP absolute volume %d%%\n",
                avrcp_subevent_notification_volume_changed_get_absolute_volume(packet) * 100 / 127);
     }
@@ -599,8 +779,186 @@ void bt_output_init(void){
 // Deferred heavy bring-up — call every main-loop iteration.  Runs the radio +
 // BTstack init exactly once, only after USB is mounted (so audio + the CDC
 // serial are up first) and a short settle so the boot banner flushes.
+// Restore the wired outputs that bring-up stood down (bracketed so the restart
+// is click-free).  bt_radio_standdown(false) re-validates the ADAT pin.
+static void bt_restore_outputs(void){
+    uint8_t restored = 0;
+    bt_pipeline_reset_prepare();
+    bt_radio_standdown(false, &restored);
+    bt_pipeline_reset_complete();
+    printf("[bt] outputs restored mask=0x%02x\n", restored);
+}
+
+static void bt_do_disconnect(void){
+    if (s_a2dp_connected || s_connecting){
+        if (media_tracker.a2dp_cid) a2dp_source_disconnect(media_tracker.a2dp_cid);
+    }
+}
+
+static bool bt_link_busy(void){
+    return s_connecting || s_a2dp_connected;
+}
+
+// Main-loop servicing of the deferred vendor commands (Core 0, never an ISR).
+static void bt_service_commands(void){
+    // --- enable / disable --------------------------------------------------
+    if (s_enable_pending){
+        bool want = s_enable_req;
+        if (want == s_user_enabled){
+            s_enable_pending = false;
+        } else if (bt_pipeline_reset_ready()){
+            s_enable_pending = false;
+            s_user_directed = true;
+            if (!want){
+                // BT off: drop the link/scan, stop streaming, power the
+                // controller down, then give the wired outputs back.
+                s_bt_enabled = false;                  // pipeline stops pushing
+                a2dp_timer_stop(&media_tracker);
+                if (s_inquiry_active) gap_inquiry_stop();
+                s_scan_abort = true; s_scanning = false; s_inquiry_active = false;
+                s_connect_pending = s_disconnect_pending = s_forget_pending = s_scan_pending = false;
+                hci_power_control(HCI_POWER_OFF);
+                s_hci_working = false; s_connecting = false; s_a2dp_connected = false;
+                s_codec = BT_CODEC_NONE;
+                media_tracker.a2dp_cid = 0; media_tracker.avrcp_cid = 0; media_tracker.stream_opened = 0;
+                s_user_enabled = false;
+                printf("[bt] disabled\n");
+                bt_restore_outputs();
+            } else {
+                uint8_t mask = 0;
+                bt_pipeline_reset_prepare();
+                bt_radio_standdown(true, &mask);
+                bt_pipeline_reset_complete();
+                s_user_enabled = true;
+                s_last_status = BT_ERR_NONE;
+                hci_power_control(HCI_POWER_ON);        // -> BTSTACK_EVENT_STATE WORKING
+                printf("[bt] enabled (stand-down mask=0x%02x)\n", mask);
+            }
+        }
+        return;      // one heavy op per tick
+    }
+    if (!s_user_enabled){
+        // Everything else needs BT on.
+        if (s_scan_pending || s_connect_pending || s_disconnect_pending || s_forget_pending){
+            s_scan_pending = s_connect_pending = s_disconnect_pending = s_forget_pending = false;
+            s_last_status = BT_ERR_DISABLED;
+        }
+        return;
+    }
+    if (!s_hci_working) return;      // controller still coming up; keep requests pending
+
+    // --- disconnect --------------------------------------------------------
+    if (s_disconnect_pending){
+        s_disconnect_pending = false;
+        s_user_directed = true;
+        bt_do_disconnect();
+    }
+
+    // --- forget (drop bond; disconnect first if it is the live peer) --------
+    if (s_forget_pending){
+        s_forget_pending = false;
+        s_user_directed = true;
+        if (bt_link_busy() && memcmp(s_target_addr, s_forget_addr, 6) == 0) bt_do_disconnect();
+        gap_drop_link_key_for_bd_addr(s_forget_addr);
+        for (uint8_t i = 0; i < s_scan_count; i++)
+            if (memcmp(s_scan[i].addr, s_forget_addr, 6) == 0) s_scan[i].flags &= (uint8_t)~BT_SCAN_FLAG_BONDED;
+        printf("[bt] forgot %s\n", bd_addr_to_str(s_forget_addr));
+    }
+
+    // --- connect (stop any scan, drop any other link first) -------------------
+    if (s_connect_pending){
+        s_user_directed = true;
+        if (s_scanning){
+            s_scan_abort = true;
+            if (s_inquiry_active) gap_inquiry_stop();
+            return;                      // wait for the scan to wind down
+        }
+        if (bt_link_busy()){
+            if (memcmp(s_target_addr, s_connect_addr, 6) == 0){
+                s_connect_pending = false;       // already connecting/connected to it
+            } else {
+                bt_do_disconnect();
+                return;                  // wait for the old link to release
+            }
+        } else {
+            s_connect_pending = false;
+            memcpy(device_addr, s_connect_addr, 6);
+            memcpy(s_target_addr, s_connect_addr, 6);
+            s_connecting = true;
+            s_last_status = BT_ERR_NONE;
+            uint8_t st = a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
+            if (st != ERROR_CODE_SUCCESS){
+                s_connecting = false;
+                s_last_status = st;
+            }
+            printf("[bt] connect %s -> 0x%02x\n", bd_addr_to_str(device_addr), st);
+        }
+    }
+
+    // --- scan --------------------------------------------------------------
+    if (s_scan_pending){
+        s_scan_pending = false;
+        if (!s_scan_req){
+            s_scan_abort = true;
+            if (s_inquiry_active) gap_inquiry_stop();
+        } else if (s_bt_enabled || bt_link_busy()){
+            // Inquiry steals radio time slots from an active link: never while streaming.
+            s_last_status = BT_ERR_BUSY;
+        } else if (!s_scanning){
+            s_scan_abort = false;
+            s_scan_count = 0;
+            s_name_idx = 0;
+            s_scanning = true;
+            s_inquiry_active = true;
+            s_last_status = BT_ERR_NONE;
+            uint8_t st = (uint8_t)gap_inquiry_start(BT_INQUIRY_UNITS);
+            if (st != ERROR_CODE_SUCCESS){
+                s_scanning = false; s_inquiry_active = false; s_last_status = st;
+            }
+        }
+    }
+}
+
+// Push NOTIFY_EVT_BT_STATE whenever the (state, codec, volume, flags, addr,
+// rate) tuple changes.  Runs here (main loop), never from the BTstack handlers.
+static void bt_notify_if_changed(void){
+    BtStatus st;
+    bt_get_status(&st);
+    uint8_t payload[BT_NOTIFY_PAYLOAD_SIZE];
+    bt_notify_payload_encode(&st, payload);
+    if (s_notify_valid && memcmp(payload, s_notify_last, sizeof payload) == 0) return;
+    memcpy(s_notify_last, payload, sizeof payload);
+    s_notify_valid = true;
+    notify_push_bt_state(payload);
+}
+
+// Request recorders (EP0 / transport context): flag only, no stack calls.
+void bt_request_enable(bool on){ s_enable_req = on; s_enable_pending = true; }
+void bt_request_scan(bool start){ s_scan_req = start; s_scan_pending = true; }
+void bt_request_connect(const uint8_t addr[6]){
+    memcpy(s_connect_addr, addr, 6); s_connect_pending = true;
+}
+void bt_request_disconnect(void){ s_disconnect_pending = true; }
+void bt_request_forget(const uint8_t addr[6]){
+    memcpy(s_forget_addr, addr, 6); s_forget_pending = true;
+}
+
 void bt_output_poll(void){
-    if (s_bringup_done) return;
+    if (s_bringup_done){
+        if (s_radio_ok){
+            bt_service_commands();
+            bt_notify_if_changed();
+        }
+        return;
+    }
+    // Before bring-up the only command that matters is "stay off": a host that
+    // disables BT before the radio is up defers the bring-up until it re-enables.
+    if (s_enable_pending){
+        s_enable_pending = false;
+        s_user_enabled = s_enable_req;
+        if (!s_user_enabled) s_user_directed = true;
+    }
+    if (!s_user_enabled) return;
     if (!tud_mounted()) return;      // let USB enumerate first
 
     // Give tud_task() a few iterations after mount so the banner flushes over
@@ -633,6 +991,7 @@ void bt_output_poll(void){
     printf("[bt] cyw43_arch_init...\n");
     if (cyw43_arch_init()){
         printf("[bt] cyw43_arch_init FAILED; restoring stood-down outputs\n");
+        s_last_status = BT_ERR_RADIO;
         // A radio failure must not leave the user's outputs dead: restore the
         // stand-down (bracketed, so the restart is click-free too).
         uint8_t restored = 0;
@@ -646,6 +1005,7 @@ void bt_output_poll(void){
 
     if (a2dp_source_and_avrcp_services_init()){
         printf("[bt] A2DP service init failed\n");
+        s_last_status = BT_ERR_RADIO;
         return;
     }
 
@@ -656,6 +1016,7 @@ void bt_output_poll(void){
 
     // Power on — the background async context drives everything from here,
     // including the auto-connect on HCI_STATE_WORKING.
+    s_radio_ok = true;
     hci_power_control(HCI_POWER_ON);
     printf("[bt] A2DP source init done, sink=%s\n", device_addr_string);
 }
@@ -673,7 +1034,10 @@ void bt_output_led(bool on){
 }
 
 bool bt_radio_resources_held(void){
-    return s_cyw43_ready;
+    // Held while the radio is initialised AND BT is enabled.  After a user
+    // disable the wired outputs are restored (the SM/DMA were only logically
+    // reserved — see bt_exclusion.h), so the vendor handlers may re-enable them.
+    return s_cyw43_ready && s_user_enabled;
 }
 
 #endif // DSPI_BT

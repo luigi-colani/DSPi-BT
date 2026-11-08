@@ -460,9 +460,20 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
         }
 #if PICO_RP2350
         if (mask & BT_STOODDOWN_ADAT) {
-            adat_output_set_config(true, adat_output_pin());
-            uint8_t v = 1;
-            notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
+            // The pin was released while ADAT was stood down: another feature
+            // may have claimed it (or the radio-pad rule changed) since.  Re-run
+            // the same validation the pin-set path uses; if it no longer holds,
+            // leave ADAT disabled rather than drive a contended pin.
+            // (adat_output_config_enabled() is false here, so the pin does not
+            // collide with itself in is_pin_in_use().)
+            uint8_t apin = adat_output_pin();
+            if (is_valid_gpio_pin(apin) && !is_pin_in_use(apin, 0xFF)) {
+                adat_output_set_config(true, apin);
+                uint8_t v = 1;
+                notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
+            } else {
+                mask &= (uint8_t)~BT_STOODDOWN_ADAT;   // left disabled
+            }
         }
 #endif
         s_bt_standdown_mask = 0;
@@ -1920,6 +1931,28 @@ static bool vendor_handle_set_body(tusb_control_request_t const *req) {
             }
             break;
         }
+
+        // ---- Bluetooth output (Pico 2 W DSPI_BT only; STALL elsewhere) ----
+        // Each handler only records a request (*_pending in bt_output.c); all
+        // BTstack/radio work runs from bt_output_poll() in the main loop.
+#if DSPI_BT
+        case REQ_BT_SET_ENABLE:
+            if (buffer->data_len >= 1) bt_request_enable(vendor_rx_buf[0] != 0);
+            else handled = false;
+            break;
+        case REQ_BT_SCAN:
+            if (buffer->data_len >= 1) bt_request_scan(vendor_rx_buf[0] != 0);
+            else handled = false;
+            break;
+        case REQ_BT_CONNECT:
+            if (buffer->data_len >= 6) bt_request_connect(vendor_rx_buf);
+            else handled = false;
+            break;
+        case REQ_BT_FORGET:
+            if (buffer->data_len >= 6) bt_request_forget(vendor_rx_buf);
+            else handled = false;
+            break;
+#endif
 
         case REQ_SIGGEN_SET_CONFIG:
             // siggen_stage_config validates type, mask and params; STALL on
@@ -4328,6 +4361,46 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
                 vendor_send_response(resp_buf, 1);
                 return true;
             }
+
+#if DSPI_BT
+            case REQ_BT_DISCONNECT: {
+                // No-payload command: dispatched on the GET path (like
+                // REQ_TEST_DAC_HW_MUTE).  Records the request and returns a
+                // status byte (0 = accepted); the disconnect runs in the main loop.
+                bt_request_disconnect();
+                resp_buf[0] = 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_BT_GET_STATUS: {
+                // Snapshot of RAM state only (no stack calls); encoded byte-wise
+                // per bt_proto.h.  Static: outlives the EP0 DATA stage.
+                static uint8_t bt_status_wire[BT_STATUS_PACKET_SIZE];
+                BtStatus st;
+                bt_get_status(&st);
+                bt_status_encode(&st, bt_status_wire);
+                vendor_send_response(bt_status_wire, sizeof(bt_status_wire));
+                return true;
+            }
+
+            case REQ_BT_GET_SCAN_RESULT: {
+                // wValue = index.  An out-of-range index returns an all-zero
+                // packet with count = total, so the host can detect the end.
+                static uint8_t bt_scan_wire[BT_SCAN_RESULT_SIZE];
+                BtScanResult r;
+                if (!bt_get_scan_result((uint8_t)setup->wValue, &r)) {
+                    BtStatus st;
+                    bt_get_status(&st);
+                    memset(&r, 0, sizeof(r));
+                    r.index = (uint8_t)setup->wValue;
+                    r.count = st.scan_count;
+                }
+                bt_scan_result_encode(&r, bt_scan_wire);
+                vendor_send_response(bt_scan_wire, sizeof(bt_scan_wire));
+                return true;
+            }
+#endif
 
             case REQ_GET_LG_SOUND_SYNC_STATUS: {
                 /* Snapshot via the module's status getter so the host

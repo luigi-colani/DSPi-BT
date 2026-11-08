@@ -101,6 +101,13 @@
 // 0, 0, name(32)]
 #define NOTIFY_EVT_DEVICE_NAME       0x10
 
+// v2 Bluetooth output state event (Pico 2 W / DSPI_BT): pushed on every
+// connection / stream transition from the main loop (bt_output_poll).
+// Packet (18 bytes): [ver=2, evt=0x11, flags=0, seq, state, codec, volume,
+// flags, addr(6), rate_LE32]; layout owned by bt_proto.h (state = BtState,
+// codec = BT_CODEC_*, volume 0..127, flags = BT_STAT_FLAG_*).
+#define NOTIFY_EVT_BT_STATE          0x11
+
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
 
@@ -173,6 +180,9 @@ void notify_push_siggen_state(uint8_t state, uint8_t reason,
 void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin);
 // I2S clock-slave lock state changed (see i2s_input.h).
 void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz);
+// Bluetooth output state changed (see bt_proto.h); payload is the 14-byte
+// bt_notify_payload.  Main-loop only.
+void notify_push_bt_state(const uint8_t payload[14]);
 // ADAT input lock state changed (RP2350; see adat_input.h).
 void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
                                   uint8_t clock_mode);

@@ -600,6 +600,17 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_LG_SOUND_SYNC_ENABLE  0xE7  // returns uint8_t
 #define REQ_GET_LG_SOUND_SYNC_STATUS  0xE8  // returns 16-byte LgSoundSyncStatus
 
+// Bluetooth audio output (Pico 2 W, DSPI_BT builds only; STALLs elsewhere).
+// Wire formats + semantics: bt_proto.h.  Everything that touches the radio /
+// BTstack is DEFERRED to the main loop (bt_output_poll) via *_pending flags.
+#define REQ_BT_SET_ENABLE           0x20  // payload = uint8_t (0 = off, 1 = on); deferred
+#define REQ_BT_SCAN                 0x21  // payload = uint8_t (1 = start inquiry, 0 = stop); deferred
+#define REQ_BT_GET_SCAN_RESULT      0x22  // wValue = index; returns 32-byte BtScanResult
+#define REQ_BT_CONNECT              0x23  // payload = 6-byte BD_ADDR; deferred
+#define REQ_BT_DISCONNECT           0x24  // no payload (GET path, wLength>=1); returns status byte 0; deferred
+#define REQ_BT_FORGET               0x25  // payload = 6-byte BD_ADDR (drop bond); deferred
+#define REQ_BT_GET_STATUS           0x26  // returns 16-byte BtStatus
+
 // System
 #define REQ_ENTER_BOOTLOADER        0xF0
 

@@ -355,6 +355,18 @@ void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin) {
     restore_interrupts(flags);
 }
 
+// Unconditional (no-op producers on non-BT builds; never called there).
+void notify_push_bt_state(const uint8_t payload[14]) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_BT_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    memcpy(e.value, payload, 14);
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 // Implemented unconditionally so it links on both platforms.
 void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz) {
     uint32_t flags = save_and_disable_interrupts();
@@ -657,6 +669,18 @@ uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_l
             out_buf[6] = e.value[2];
             out_buf[7] = e.value[3];
             return 8;
+        }
+
+        case NOTIFY_EVT_BT_STATE: {
+            // 18 bytes: BtState payload (state, codec, volume, flags,
+            // addr[6], rate LE32) in bytes 4..17 — see bt_proto.h.
+            if (max_len < 18) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_BT_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            memcpy(&out_buf[4], e.value, 14);
+            return 18;
         }
 
         case NOTIFY_EVT_ADAT_INPUT_STATE: {

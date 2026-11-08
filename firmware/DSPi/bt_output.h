@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "bt_proto.h"
 
 #if DSPI_BT
 
@@ -30,6 +31,19 @@ void bt_output_led(bool on);
 // handlers refuse to re-enable the wired outputs that were stood down to free
 // those resources (the PDM sub, the ADAT bulk output).
 bool bt_radio_resources_held(void);
+
+// ---- Vendor-command control surface (Task 5) -------------------------------
+// Called from the EP0 / external-transport context: each ONLY records the
+// request and returns (a *_pending flag); bt_output_poll() performs the
+// BTstack/radio work from the main loop.  Last request wins for each kind.
+void bt_request_enable(bool on);
+void bt_request_scan(bool start);
+void bt_request_connect(const uint8_t addr[6]);
+void bt_request_disconnect(void);
+void bt_request_forget(const uint8_t addr[6]);
+// Snapshot readers — plain RAM reads, no stack calls (safe from EP0).
+void bt_get_status(BtStatus *out);
+bool bt_get_scan_result(uint8_t index, BtScanResult *out);
 
 // Resource mutual-exclusion (implemented in vendor_commands.c, where the output
 // matrix + PDM/ADAT teardown machinery live).  Stand down (on=true) or restore
