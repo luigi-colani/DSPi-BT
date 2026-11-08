@@ -1475,8 +1475,8 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                                new_freq == 96000u);
                 }
                 // BT streaming: SBC can't carry 96 kHz -> reject like any
-                    // other unsupported rate (always true on non-BT builds).
-                    if (rate_ok && !bt_output_rate_allowed(new_freq)) rate_ok = false;
+                // other unsupported rate (always true on non-BT builds).
+                if (rate_ok && !bt_output_rate_allowed(new_freq)) rate_ok = false;
                 if (!rate_ok) {
                     // Stall EP0 — per UAC1, unsupported control values
                     // must be rejected rather than silently clamped.

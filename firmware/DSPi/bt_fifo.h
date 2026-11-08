@@ -146,6 +146,7 @@ static inline void bt_fifo_reset_ring(bt_fifo_t *f) {
 // float->int cast does), matching the SBC encoder's int16 input domain.
 static inline int16_t bt_fifo_f32_to_s16(float v) {
     float s = v * 32767.0f;
+    if (!(s == s))      return 0;          // NaN -> silence
     if (s >= 32767.0f)  return (int16_t)32767;
     if (s <= -32768.0f) return (int16_t)-32768;
     return (int16_t)s;
@@ -251,6 +252,7 @@ static inline uint32_t bt_fifo_pop_drift(bt_fifo_t *f,
             f->drift_duplicated_frames++;
             return n;
         }
+        f->underflow_frames += 1;   // pop_n counted n-1-got; real shortfall is n-got
         return got;   // genuine underflow; caller pads silence
     }
     return bt_fifo_pop_n(f, interleaved, n);

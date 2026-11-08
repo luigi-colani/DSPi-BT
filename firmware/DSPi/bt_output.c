@@ -323,7 +323,7 @@ static int a2dp_source_and_avrcp_services_init(void){
     btstack_assert(de_get_len(device_id_sdp_service_buffer) <= sizeof(device_id_sdp_service_buffer));
     sdp_register_service(device_id_sdp_service_buffer);
 
-    gap_set_local_name("DSPi A2DP 00:00:00:00:00:00");
+    gap_set_local_name("DSPi A2DP");
     gap_discoverable_control(1);
     gap_set_class_of_device(0x200408);
 
@@ -356,6 +356,7 @@ static int a2dp_fill_sbc_audio_buffer(a2dp_media_sending_context_t * context){
     int total_num_bytes_read = 0;
     unsigned int num_audio_samples_per_sbc_buffer = sbc_encoder_instance->num_audio_frames(&sbc_encoder_state);
     uint16_t sbc_buffer_length = sbc_encoder_instance->sbc_buffer_length(&sbc_encoder_state);
+    btstack_assert(num_audio_samples_per_sbc_buffer <= 256);   // pcm_frame[256 * NUM_CHANNELS] capacity
     while (context->samples_ready >= num_audio_samples_per_sbc_buffer
         && (context->max_media_payload_size - context->sbc_storage_count) >= sbc_buffer_length){
 
@@ -431,7 +432,7 @@ static void a2dp_timer_stop(a2dp_media_sending_context_t * context){
     context->time_audio_data_sent = 0;
     context->acc_num_missed_samples = 0;
     context->samples_ready = 0;
-    context->streaming = 1;
+    context->streaming = 0;
     context->sbc_storage_count = 0;
     context->sbc_ready_to_send = 0;
     btstack_run_loop_remove_timer(&context->audio_timer);
@@ -1089,16 +1090,21 @@ void bt_output_poll(void){
     s_cyw43_ready = true;
     printf("[bt] cyw43 init OK\n");
 
-    if (a2dp_source_and_avrcp_services_init()){
+    cyw43_arch_lwip_begin();
+    int svc_rc = a2dp_source_and_avrcp_services_init();
+    cyw43_arch_lwip_end();
+    if (svc_rc){
         printf("[bt] A2DP service init failed\n");
         s_last_status = BT_ERR_RADIO;
         return;
     }
 
     // Periodic [btm] stats line.
+    cyw43_arch_lwip_begin();
     btstack_run_loop_set_timer_handler(&stats_timer, stats_timeout_handler);
     btstack_run_loop_set_timer(&stats_timer, 1000);
     btstack_run_loop_add_timer(&stats_timer);
+    cyw43_arch_lwip_end();
 
     // Power on — the background async context drives everything from here,
     // including the auto-connect on HCI_STATE_WORKING.
