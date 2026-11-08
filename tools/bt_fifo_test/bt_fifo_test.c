@@ -222,6 +222,8 @@ typedef struct {
     int      lr_ok;        // R channel always == -L
 } drift_result_t;
 
+static int stats_primed_only = 0;   // ignore fill samples before hold-off ends
+
 static drift_result_t run_drift(double fp, double fc, double seconds,
                                 int use_drift, uint32_t prefill) {
     drift_result_t res = { UINT32_MAX, 0, 0, 0, 0, 0, 1, 1 };
@@ -266,6 +268,7 @@ static drift_result_t run_drift(double fp, double fc, double seconds,
                 prev = v; have_prev = 1;
             }
             uint32_t fill = bt_fifo_available(&fifo);
+            if (stats_primed_only && !fifo.primed) { tc += dc; continue; }
             if (fill < res.min_fill) res.min_fill = fill;
             if (fill > res.max_fill) res.max_fill = fill;
             tc += dc;
@@ -350,6 +353,7 @@ static void test_drift_hysteresis(void) {
     for (uint32_t i = 0; i < POP_CHUNK; i++) { l[i] = 0.1f; r[i] = -0.1f; }
     uint32_t target = BT_FIFO_DRIFT_LOW - 1;
     while (bt_fifo_available(&fifo) < target) bt_fifo_push_n(&fifo, l, r, 1);
+    fifo.primed = 1;                                  // steady state, not startup
     uint32_t dups_seen = 0, transitions = 0, prev_dup = 0;
     for (int k = 0; k < 400; k++) {
         uint32_t before = fifo.drift_duplicated_frames;
@@ -367,6 +371,31 @@ static void test_drift_hysteresis(void) {
     CHECK(bt_fifo_available(&fifo) >= BT_FIFO_DRIFT_LOW_EXIT);
 }
 
+static void test_drift_startup_from_empty(void) {
+    printf("test_drift_startup_from_empty (prefill=0: hold-off, then bounded)\n");
+    for (int dir = 0; dir < 2; dir++) {
+        double fp = dir ? 48000.0 * 1.0005 : 48000.0;
+        double fc = dir ? 48000.0 : 48000.0 * 1.0005;
+        stats_primed_only = 1;
+        drift_result_t r = run_drift(fp, fc, 120, 1, 0);
+        stats_primed_only = 0;
+        report(dir ? "startup, producer fast" : "startup, consumer fast", r);
+        CHECK(fifo.primed);                       // reached steady state
+        CHECK_EQ_U(r.underflow, 0);               // hold-off: no startup underflow
+        CHECK_EQ_U(r.overflow, 0);
+        CHECK(r.min_fill != UINT32_MAX);          // got post-ramp samples
+        CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK >= BT_FIFO_DRIFT_LOW);
+        CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK);
+        CHECK(r.framing_ok);
+    }
+    // Reset re-arms the hold-off and clears drift mode.
+    fifo.drift_mode = BT_FIFO_DRIFT_SKIP;
+    bt_fifo_reset_ring(&fifo);
+    CHECK_EQ_U(fifo.primed, 0);
+    CHECK_EQ_U(fifo.drift_mode, BT_FIFO_DRIFT_IDLE);
+    CHECK_EQ_U(bt_fifo_available(&fifo), 0);
+}
+
 int main(void) {
     printf("=== bt_fifo host test ===\n");
     test_init_empty();
@@ -381,6 +410,7 @@ int main(void) {
     test_drift_44k1_and_large();
     test_drift_no_drift_is_quiet();
     test_drift_hysteresis();
+    test_drift_startup_from_empty();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     if (failures) {

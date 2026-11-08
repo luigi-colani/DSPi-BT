@@ -74,6 +74,7 @@ typedef struct {
     volatile uint32_t drift_duplicated_frames;  // frames repeated (fill low)
     volatile uint32_t drift_fill;               // fill seen at the last pop
     volatile uint8_t  drift_mode;               // BT_FIFO_DRIFT_{IDLE,DUP,SKIP}
+    volatile uint8_t  primed;                   // 0 = prefill hold-off active
 } bt_fifo_t;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +89,8 @@ typedef struct {
 // Hysteresis: a correction mode engages past LOW/HIGH and only releases once
 // fill is back inside the LOW_EXIT/HIGH_EXIT band, so it cannot thrash near a
 // threshold.  The band sits around TARGET (~21 ms @ 48 kHz); the media timer
-// should prefill to TARGET before the first pop.
+// is held off (bt_fifo_pop_drift returns 0, no underflow counted, caller pads
+// silence) until fill first reaches TARGET after a reset/stream start.
 // ---------------------------------------------------------------------------
 #define BT_FIFO_DRIFT_TARGET     1024u
 #define BT_FIFO_DRIFT_LOW         512u   // enter DUP below this
@@ -111,11 +113,13 @@ static inline void bt_fifo_init(bt_fifo_t *f) {
     f->drift_duplicated_frames = 0;
     f->drift_fill = 0;
     f->drift_mode = BT_FIFO_DRIFT_IDLE;
+    f->primed = 0;
 }
 
 // Reset drift state only (ring and counters untouched).
 static inline void bt_fifo_drift_init(bt_fifo_t *f) {
     f->drift_mode = BT_FIFO_DRIFT_IDLE;
+    f->primed = 0;
 }
 
 // Frames currently available to pop.
@@ -133,6 +137,8 @@ static inline uint32_t bt_fifo_free(const bt_fifo_t *f) {
 static inline void bt_fifo_reset_ring(bt_fifo_t *f) {
     __dmb();
     f->tail = f->head;
+    f->drift_mode = BT_FIFO_DRIFT_IDLE;   // stream start: re-arm prefill
+    f->primed = 0;
 }
 
 // Full-scale float [-1,1] -> clamped signed 16-bit.  Values past the rails
@@ -214,6 +220,11 @@ static inline uint32_t bt_fifo_pop_drift(bt_fifo_t *f,
                                          uint32_t n) {
     uint32_t avail = bt_fifo_available(f);
     f->drift_fill = avail;
+
+    if (!f->primed) {
+        if (avail < BT_FIFO_DRIFT_TARGET) return 0;   // hold-off: silence
+        f->primed = 1;
+    }
 
     uint8_t mode = f->drift_mode;
     if (mode == BT_FIFO_DRIFT_DUP) {
