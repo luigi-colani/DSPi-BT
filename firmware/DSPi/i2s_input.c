@@ -66,6 +66,7 @@
 #include "pico/audio_i2s_multi.h"
 
 #include "i2s_input.pio.h"
+#include "bt_output.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1033,7 +1034,7 @@ bool i2s_slave_check_rate_change(void) {
     if (i2s_slave_state != I2S_SLAVE_LOCKED) return false;
     uint32_t rate = i2s_slave_detected_rate;
     if (rate == 0) return false;
-    if (rate != audio_state.freq) {
+    if (rate != audio_state.freq && bt_output_apply_rate_policy(rate) != audio_state.freq) {
         // Same deferred mechanism as USB/SPDIF rate changes
         pending_rate = rate;
         __dmb();

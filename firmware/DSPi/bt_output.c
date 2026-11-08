@@ -1121,6 +1121,10 @@ void bt_output_led(bool on){
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
 }
 
+uint32_t bt_output_sink_rate(void){
+    return bt_rate_sink_or_default((uint32_t)current_sample_rate);
+}
+
 bool bt_output_user_enabled(void){
     return s_user_enabled;
 }

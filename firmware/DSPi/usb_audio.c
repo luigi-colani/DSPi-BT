@@ -33,6 +33,7 @@
 #include "class/audio/audio.h"
 
 #include "usb_audio.h"
+#include "bt_output.h"
 #include "audio_pipeline.h"
 #include "output_latency.h"
 #include "adat_output.h"
@@ -84,6 +85,7 @@ uint32_t usb_audio_get_selected_rate(void) {
 static void usb_audio_set_selected_rate(uint32_t rate) {
     usb_selected_rate = rate;
     if (active_input_source != INPUT_SOURCE_USB || rate == audio_state.freq) return;
+    if (bt_output_apply_rate_policy(rate) == audio_state.freq) return;  // BT already pins the pipeline here
 
     pending_rate = rate;
     __dmb();
@@ -1472,6 +1474,9 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                                new_freq == 48000u ||
                                new_freq == 96000u);
                 }
+                // BT streaming: SBC can't carry 96 kHz -> reject like any
+                    // other unsupported rate (always true on non-BT builds).
+                    if (rate_ok && !bt_output_rate_allowed(new_freq)) rate_ok = false;
                 if (!rate_ok) {
                     // Stall EP0 — per UAC1, unsupported control values
                     // must be rejected rather than silently clamped.

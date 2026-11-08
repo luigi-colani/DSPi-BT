@@ -163,6 +163,9 @@ static void apply_nominal_output_rate(uint32_t sample_freq) {
 // an active_input_source check (active is still the OLD source there).
 static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_prefill) {
     switch (new_freq) { case 44100: case 48000: case 96000: break; default: new_freq = 44100; }
+    // BT-active policy (no-op unless A2DP is streaming): follow the sink's SBC
+    // rate; 96 kHz cannot be carried by SBC and DSPi does not resample.
+    new_freq = bt_output_apply_rate_policy(new_freq);
 
     // Engage mute and wait for Core 1 EQ worker to drain before touching
     // filter coefficients or PIO dividers. Without this bracket, old-rate
@@ -2760,6 +2763,30 @@ int main(void) {
         // hardware-mute hold; perform_rate_change()'s own
         // prepare_pipeline_reset() then engages the soft mute + Core 1 fence
         // and re-asserts the (already-held) hardware mute idempotently.
+#if DSPI_BT
+        // BT rate policy: when A2DP streaming starts/reconfigures, align the
+        // pipeline to the sink's SBC rate through the normal deferred path;
+        // when it stops with USB owning the pipeline, return to the host's
+        // selected rate (which may be 96 kHz again).
+        {
+            static bool bt_prev_active = false;
+            bool bt_now = bt_output_is_enabled();
+            if (!rate_change_pending) {
+                uint32_t want = 0;
+                if (bt_now) {
+                    want = bt_output_apply_rate_policy(audio_state.freq);
+                } else if (bt_prev_active && active_input_source == INPUT_SOURCE_USB) {
+                    want = usb_audio_get_selected_rate();
+                }
+                if (want && want != audio_state.freq) {
+                    pending_rate = want;
+                    __dmb();
+                    rate_change_pending = true;
+                }
+            }
+            bt_prev_active = bt_now;
+        }
+#endif
         if (rate_change_pending && pipeline_reset_ready()) {
             uint32_t r = pending_rate;
             rate_change_pending = false;

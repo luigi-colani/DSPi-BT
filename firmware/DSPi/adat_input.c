@@ -48,6 +48,7 @@
 #include "pico/stdlib.h"
 
 #include "adat_input.pio.h"
+#include "bt_output.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -700,6 +701,7 @@ bool adat_input_check_rate_change(void) {
     if (adat_rx_state != ADAT_INPUT_LOCKED) return false;
     uint32_t rate = adat_rx_detected_rate;
     if (rate == 0 || rate == audio_state.freq) return false;
+    if (bt_output_apply_rate_policy(rate) == audio_state.freq) return false;
     pending_rate = rate;
     __dmb();
     rate_change_pending = true;

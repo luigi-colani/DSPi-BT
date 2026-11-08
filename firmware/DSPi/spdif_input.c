@@ -28,6 +28,7 @@
 #include "pico/audio_i2s_multi.h"
 #include "adat_output.h"
 #include "input_servo.h"
+#include "bt_output.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -249,7 +250,7 @@ uint32_t spdif_input_get_sample_rate(void) {
 bool spdif_input_check_rate_change(void) {
     uint32_t rate = spdif_rx_detected_rate;
     if (rate == 0 || !is_supported_rate(rate)) return false;
-    if (rate != audio_state.freq) {
+    if (rate != audio_state.freq && bt_output_apply_rate_policy(rate) != audio_state.freq) {
         // Signal rate change to main loop (same mechanism as USB rate change)
         pending_rate = rate;
         __dmb();

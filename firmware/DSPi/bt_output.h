@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "bt_proto.h"
+#include "bt_rate.h"
 
 #if DSPI_BT
 
@@ -78,6 +79,30 @@ bool bt_pipeline_reset_ready(void);
 void bt_pipeline_reset_prepare(void);
 void bt_pipeline_reset_complete(void);
 
+// Sink's negotiated SBC sampling rate in Hz (44100 / 48000), or the preferred
+// default before a codec is configured.  Plain RAM read, any context.
+uint32_t bt_output_sink_rate(void);
+
 #endif // DSPI_BT
+
+// ---- Rate policy (Task 7) --------------------------------------------------
+// While BT streams, the pipeline follows the sink's SBC rate and 96 kHz is
+// refused.  Both helpers are identity / always-true on non-BT builds, so wired
+// rate behaviour is unchanged there.
+static inline uint32_t bt_output_apply_rate_policy(uint32_t requested) {
+#if DSPI_BT
+    return bt_rate_clamp(requested, bt_output_is_enabled(), bt_output_sink_rate());
+#else
+    return requested;
+#endif
+}
+static inline bool bt_output_rate_allowed(uint32_t requested) {
+#if DSPI_BT
+    return bt_rate_allowed(requested, bt_output_is_enabled());
+#else
+    (void)requested;
+    return true;
+#endif
+}
 
 #endif // BT_OUTPUT_H
