@@ -56,6 +56,7 @@
 #include "pico/audio_spdif.h"
 #include "usb_feedback_controller.h"
 #include "usb_descriptors.h"
+#include "bt_output.h"
 #include "tusb.h"
 #include "pico/binary_info.h"
 #include "build_info.h"
@@ -2147,6 +2148,11 @@ int main(void) {
 #endif
 
     core0_init();
+
+#if DSPI_BT
+    // Bluetooth output (Pico 2 W): radio + BTstack are serviced from Core 0.
+    bt_output_init();
+#endif
 
     // Enable watchdog
     watchdog_enable(8000, 1);

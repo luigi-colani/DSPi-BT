@@ -6,6 +6,20 @@
 #include <limits.h>
 
 // ----------------------------------------------------------------------------
+// BLUETOOTH (Pico 2 W, DSPI_BT) - RADIO-RESERVED GPIOs
+// ----------------------------------------------------------------------------
+// On the Pico W / Pico 2 W these GPIOs are wired to the CYW43439 radio and are
+// not available as user pins when DSPI_BT is enabled.  Defined here only;
+// enforcement in pin validation is a later task.
+#define CYW43_PIN_WL_DATA        24   // SPI data / IRQ (shared)
+#define CYW43_PIN_WL_CS          25   // SPI chip select (also the Pico LED on non-W)
+#define CYW43_PIN_WL_CLK         29   // SPI clock (also VSYS ADC sense)
+#define CYW43_PIN_WL_ON          23   // radio power enable
+#define DSPI_BT_RESERVED_PIN_MASK ((1u << 23) | (1u << 24) | (1u << 25) | (1u << 29))
+#define DSPI_BT_RESERVED_PIN_LIST { 23, 24, 25, 29 }
+
+
+// ----------------------------------------------------------------------------
 // GLOBAL VARIABLES
 // ----------------------------------------------------------------------------
 extern volatile int overruns;

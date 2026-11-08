@@ -148,6 +148,26 @@ if (DSPI_LOOP_PROF)
     target_compile_definitions(DSPi PRIVATE DSPI_LOOP_PROF=1)
 endif()
 
+# DSPI_BT: Bluetooth (A2DP source) audio output.  Pico 2 W only; the CYW43
+# radio, BTstack and the SBC encoder are linked only when this is ON.  Default
+# OFF so non-W / RP2040 builds carry no radio code.
+option(DSPI_BT "Build the Bluetooth audio output (requires PICO_BOARD=pico2_w)" OFF)
+if (DSPI_BT)
+    if (NOT PICO_BOARD STREQUAL "pico2_w")
+        message(FATAL_ERROR "DSPI_BT=ON requires -DPICO_BOARD=pico2_w (got '${PICO_BOARD}')")
+    endif()
+    target_sources(DSPi PRIVATE bt_output.c bt_output.h btstack_config.h)
+    # CYW43_LWIP=0: Bluetooth only, no Wi-Fi/IP stack (no lwIP linked).
+    target_compile_definitions(DSPi PRIVATE DSPI_BT=1 CYW43_LWIP=0)
+    target_link_libraries(DSPi
+        pico_cyw43_arch_threadsafe_background
+        pico_btstack_classic
+        pico_btstack_cyw43
+        pico_btstack_sbc_encoder
+        pico_multicore
+    )
+endif()
+
 if (PICO_PLATFORM STREQUAL "rp2040")
     # RP2040: SPDIF RX on PIO1 SM2 (SM0=PDM; SM1 free since MCK moved to
     # CLK_GPOUT). I2S RX reuses the same SM when SPDIF RX is inactive.
