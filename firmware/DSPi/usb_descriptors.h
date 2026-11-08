@@ -69,6 +69,17 @@
 #define NOTIFY_EP_MAX_PKT       64U
 #define NOTIFY_EP_INTERVAL_MS   0U
 
+#if DSPI_BT
+// CDC ACM endpoints (Bluetooth build only).  0x84/0x85 IN and 0x02 OUT are
+// free (0x01 OUT + 0x82/0x83 IN are the audio/notify EPs; 0x81 is loopback,
+// which is not built with DSPI_BT).
+#define CDC_NOTIF_ENDPOINT      0x84U
+#define CDC_NOTIF_EP_SIZE       8U
+#define CDC_OUT_ENDPOINT        0x02U
+#define CDC_IN_ENDPOINT         0x85U
+#define CDC_DATA_EP_SIZE        64U
+#endif
+
 // Notification event type constants are now defined in notify.h
 // (NOTIFY_EVT_IDLE, NOTIFY_EVT_MASTER_VOLUME, NOTIFY_EVT_PARAM_CHANGED, ...).
 // Legacy aliases retained for any code still using the old names.
@@ -88,6 +99,14 @@
 // numbers 0/1/2 are unchanged so normal-build descriptors are unaffected.
 #define ITF_NUM_LOOPBACK_AC     3   // capture AudioControl
 #define ITF_NUM_LOOPBACK_AS     4   // capture AudioStreaming
+#define ITF_NUM_TOTAL           5
+#elif DSPI_BT
+// Bluetooth build: a CDC ACM function appended after the vendor interface for
+// USB serial (the [btm] metrics line + BTstack logs over /dev/ttyACM0).
+// Interface numbers 0/1/2 are unchanged.  DSPI_LOOPBACK and DSPI_BT are never
+// enabled together (separate build dirs).
+#define ITF_NUM_CDC             3   // CDC ACM control
+#define ITF_NUM_CDC_DATA        4   // CDC ACM data
 #define ITF_NUM_TOTAL           5
 #else
 #define ITF_NUM_TOTAL           3
@@ -156,6 +175,9 @@
 #define STRID_MANUFACTURER  1
 #define STRID_PRODUCT       2
 #define STRID_SERIAL        3
+#if DSPI_BT
+#define STRID_CDC           4   // CDC ACM interface name (Bluetooth build)
+#endif
 
 // Exported for main.c — populated from chip unique ID at boot.
 extern char usb_descriptor_str_serial[17];

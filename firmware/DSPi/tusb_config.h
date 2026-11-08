@@ -31,7 +31,17 @@ extern "C" {
 // The UAC1 audio function is handled by a custom class driver registered via
 // usbd_app_driver_get_cb() (see usb_audio.c).
 #define CFG_TUD_AUDIO           0
+#if DSPI_BT
+// Bluetooth build adds a CDC ACM interface for USB serial (the [btm] metrics
+// line + BTstack logs over /dev/ttyACM0), driven by pico_stdio_usb on top of
+// the app's own TinyUSB device + tud_task (no second device stack).
+#define CFG_TUD_CDC             1
+#define CFG_TUD_CDC_RX_BUFSIZE  256
+#define CFG_TUD_CDC_TX_BUFSIZE  512
+#define CFG_TUD_CDC_EP_BUFSIZE  64
+#else
 #define CFG_TUD_CDC             0
+#endif
 #define CFG_TUD_MSC             0
 #define CFG_TUD_HID             0
 #define CFG_TUD_MIDI            0

@@ -26,6 +26,9 @@ static const char *const string_table[] = {
     "GitHub.com/WeebLabs", // 1 — manufacturer
     "Weeb Labs DSPi",      // 2 — product
     usb_descriptor_str_serial, // 3 — serial (populated at boot)
+#if DSPI_BT
+    "DSPi BT Serial",      // 4 — CDC ACM (metrics/log) interface name
+#endif
 };
 
 // ----------------------------------------------------------------------------
@@ -164,6 +167,9 @@ static const tusb_desc_device_t device_descriptor = {
 //   + iso IN EP(9) + CS iso EP(7) = 102 bytes.
 #define LOOPBACK_DESC_LEN 102
 #define CONFIG_TOTAL_LEN  (CONFIG_BASE_LEN + LOOPBACK_DESC_LEN)
+#elif DSPI_BT
+// Bluetooth build appends one CDC ACM function (IAD + CDC control + CDC data).
+#define CONFIG_TOTAL_LEN  (CONFIG_BASE_LEN + TUD_CDC_DESC_LEN)
 #else
 #define CONFIG_TOTAL_LEN  CONFIG_BASE_LEN
 #endif
@@ -581,6 +587,15 @@ const uint8_t usb_config_descriptor[] = {
     0x00,                               // bLockDelayUnits
     U16_TO_U8S_LE(0x0000),              // wLockDelay
 #endif // DSPI_LOOPBACK
+
+#if DSPI_BT
+    // --- CDC ACM function (Bluetooth build) -------------------------------
+    // USB serial for the [btm] metrics line + BTstack logs (/dev/ttyACM0).
+    // TUD_CDC_DESCRIPTOR emits its own IAD + CDC control interface (notif EP)
+    // + CDC data interface (bulk IN/OUT) = TUD_CDC_DESC_LEN (66) bytes.
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, CDC_NOTIF_ENDPOINT, CDC_NOTIF_EP_SIZE,
+                       CDC_OUT_ENDPOINT, CDC_IN_ENDPOINT, CDC_DATA_EP_SIZE),
+#endif // DSPI_BT
 };
 
 // Catch any miscount in the packed descriptor table at compile time (the array

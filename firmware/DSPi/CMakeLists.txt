@@ -156,7 +156,7 @@ if (DSPI_BT)
     if (NOT PICO_BOARD STREQUAL "pico2_w")
         message(FATAL_ERROR "DSPI_BT=ON requires -DPICO_BOARD=pico2_w (got '${PICO_BOARD}')")
     endif()
-    target_sources(DSPi PRIVATE bt_output.c bt_output.h btstack_config.h)
+    target_sources(DSPi PRIVATE bt_output.c bt_output.h bt_fifo.h bt_metrics.h btstack_config.h)
     # CYW43_LWIP=0: Bluetooth only, no Wi-Fi/IP stack (no lwIP linked).
     target_compile_definitions(DSPi PRIVATE DSPI_BT=1 CYW43_LWIP=0)
     target_link_libraries(DSPi
@@ -165,6 +165,12 @@ if (DSPI_BT)
         pico_btstack_cyw43
         pico_btstack_sbc_encoder
         pico_multicore
+        # USB-serial for the [btm] metrics line + BTstack logs.  The app owns
+        # the TinyUSB device + tud_task and provides its own descriptors (now
+        # including a CDC interface), so pico_stdio_usb auto-disables its own
+        # tusb_init / background task / default descriptors (LIB_TINYUSB_DEVICE
+        # is set) and just drives tud_cdc under its mutex.
+        pico_stdio_usb
     )
 endif()
 

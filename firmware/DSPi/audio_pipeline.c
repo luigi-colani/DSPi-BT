@@ -30,6 +30,11 @@
 #include "output_s24.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "output_latency.h"
+#if DSPI_BT
+#include "bt_output.h"  // bt_output_is_enabled()
+#include "bt_fifo.h"    // bt_fifo_push() — additive Bluetooth tap (mains)
+#endif
+#include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
 #include "hardware/timer.h"
@@ -709,6 +714,18 @@ void __no_inline_not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // PDM is inactive in EQ_WORKER mode
         global_status.peaks[CH_OUT_SUB] = 0;
 
+#if DSPI_BT
+        // Bluetooth A2DP tap (additive): forward the processed main pair
+        // (outputs 0-1) into the lock-free FIFO for the SBC source.  Taken
+        // here — after per-output EQ/gain/delay, before the in-place S24
+        // finalize that would overwrite the float scale — so it never alters
+        // the wired output path or inter-output sample alignment.  Non-
+        // blocking: a full FIFO drops frames (counted), never stalls Core 0.
+        if (bt_output_is_enabled()) {
+            bt_fifo_push(buf_out[0], buf_out[1], sample_count);
+        }
+#endif
+
         // Core 0: finalize outputs 0-1 (see output_s24.h).  ADAT active:
         // convert to S24 in place first, so ADAT always sees converted
         // samples; otherwise fuse convert+interleave and skip the in-place
@@ -847,6 +864,17 @@ void __no_inline_not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
             rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
+
+#if DSPI_BT
+        // Bluetooth A2DP tap (additive): forward the processed main pair
+        // (outputs 0-1) into the lock-free FIFO for the SBC source.  Same tap
+        // point as the dual-core branch — after per-output EQ/gain/delay,
+        // before the in-place S24 finalize — so the wired output path and
+        // inter-output sample alignment are untouched.  Non-blocking.
+        if (bt_output_is_enabled()) {
+            bt_fifo_push(buf_out[0], buf_out[1], sample_count);
+        }
+#endif
 
         // Finalize outputs 0-7 (see output_s24.h).  ADAT active: convert to
         // S24 in place first, so ADAT always sees converted samples; otherwise

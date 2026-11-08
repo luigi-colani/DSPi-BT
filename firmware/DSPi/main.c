@@ -1679,8 +1679,13 @@ static void complete_flash_write_operation_full(void) {
 }
 
 void core0_init() {
-    // LED setup
+#if !DSPI_BT
+    // LED setup.  GPIO 25 is the Pico's onboard LED on non-W boards, but on
+    // the Pico 2 W it is the CYW43 radio's SPI chip-select — driving it there
+    // would corrupt radio traffic, so the LED is handled via the WL GPIO
+    // (cyw43_arch_gpio_put) in the heartbeat instead (see main loop).
     gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+#endif
 
 #if PICO_RP2350
     // Enable flush-to-zero and default-NaN for audio processing.
@@ -1711,7 +1716,12 @@ void core0_init() {
     set_sys_clock_pll(1536000000, 5, 1);
 #endif
 
+#if !DSPI_BT
+    // GPIO 23 forces the RP2350 SMPS into PWM mode (lower audio-band ripple)
+    // on non-W boards.  On the Pico 2 W this pin is the CYW43 radio power
+    // enable (WL_ON), owned by cyw43_arch_init(); leave it alone here.
     gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 1);
+#endif
 
     pico_get_unique_board_id_string(usb_descriptor_str_serial, 17);
 
@@ -2139,9 +2149,13 @@ static void input_service_servos(void) {
 }
 
 int main(void) {
-    // Initial LED on to show we're alive
+#if !DSPI_BT
+    // Initial LED on to show we're alive.  (Pico 2 W: GPIO 25 is the radio
+    // chip-select; the onboard LED is driven via the WL GPIO after cyw43 is
+    // up — see the heartbeat in the main loop.)
     gpio_init(25); gpio_set_dir(25, GPIO_OUT);
     gpio_put(25, 1);
+#endif
 
 #if !PICO_RP2350
     set_sys_clock_pll(1536000000, 4, 2);
@@ -2174,6 +2188,12 @@ int main(void) {
         // for the audio stream itself.
         LOOP_PROF(LP_USB_VENDOR);
         tud_task();
+
+#if DSPI_BT
+        // Deferred Bluetooth bring-up: runs the blocking cyw43 + BTstack init
+        // once, after USB has enumerated (so audio + CDC serial come up first).
+        bt_output_poll();
+#endif
 
         // Fire any queued device→host notifications to EP 0x83.  Emit is
         // deferred from update_master_volume() to here so we never call
@@ -3747,7 +3767,15 @@ int main(void) {
         static uint32_t loop_counter = 0;
         if (++loop_counter >= 1000) {
             loop_counter = 0;
+#if DSPI_BT
+            // Pico 2 W: the onboard LED hangs off the CYW43 radio, driven via
+            // the WL GPIO (safe once cyw43_arch is up; a no-op before then).
+            static bool bt_led_on = false;
+            bt_led_on = !bt_led_on;
+            bt_output_led(bt_led_on);
+#else
             gpio_xor_mask(1u << 25);
+#endif
         }
     }
 }
