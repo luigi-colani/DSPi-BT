@@ -167,6 +167,11 @@ void bulk_params_collect(WireBulkParams *out) {
     // Matrix outputs
     for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
         out->outputs[o].enabled = matrix_mixer.outputs[o].enabled;
+#if DSPI_BT
+        // A PDM sub stood down for the radio is still configured on.
+        if (o == NUM_OUTPUT_CHANNELS - 1 && bt_standdown_holds(BT_STOODDOWN_PDM))
+            out->outputs[o].enabled = 1;
+#endif
         out->outputs[o].mute = matrix_mixer.outputs[o].mute;
         out->outputs[o].gain_db = matrix_mixer.outputs[o].gain_db;
         out->outputs[o].delay_ms = matrix_mixer.outputs[o].delay_ms;
@@ -315,6 +320,9 @@ void bulk_params_collect(WireBulkParams *out) {
     // reserved) stays zeroed on RP2040 from the memset above.
 #if PICO_RP2350
     out->adat_config.enabled = adat_output_config_enabled() ? 1 : 0;
+#if DSPI_BT
+    if (bt_standdown_holds(BT_STOODDOWN_ADAT)) out->adat_config.enabled = 1;   // stood down for the radio
+#endif
     out->adat_config.pin     = adat_output_pin();
 #endif
 
@@ -471,8 +479,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
         bool want_enabled = (in->outputs[o].enabled != 0);
 #if DSPI_BT
-        if (o == NUM_OUTPUT_CHANNELS - 1 && want_enabled && bt_radio_resources_held())
+        if (o == NUM_OUTPUT_CHANNELS - 1 && bt_radio_resources_held()) {
+            bt_standdown_set_intent(BT_STOODDOWN_PDM, want_enabled);   // restored at BT off
             want_enabled = false;
+        }
 #endif
         matrix_mixer.outputs[o].enabled = want_enabled ? 1 : 0;
         matrix_mixer.outputs[o].mute = in->outputs[o].mute;
@@ -766,7 +776,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         // down so the radio could claim its PIO SM1 + DMA.  A pushed config must
         // not re-enable it while the radio holds those resources; the stored
         // enable intent is honoured again once the radio is disabled.
-        if (enabled && bt_radio_resources_held()) enabled = 0;
+        if (bt_radio_resources_held()) {
+            bt_standdown_set_intent(BT_STOODDOWN_ADAT, enabled != 0);   // restored at BT off
+            enabled = 0;
+        }
 #endif
         adat_output_set_config(enabled != 0, pin);
         if (adat_output_config_enabled() == adat_out_was_en &&

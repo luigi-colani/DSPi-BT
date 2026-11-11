@@ -44,6 +44,7 @@
 // without pulling in config.h's firmware-wide NUM_CHANNELS.  The deferred
 // persist write (preset_set_bt_enabled) is performed from main.c.
 bool preset_get_bt_enabled(void);
+bool preset_get_bt_last_sink(uint8_t out[6]);   // flash_storage.c (DIR V26)
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -282,6 +283,14 @@ static bool s_user_directed = false;  // a command has steered the link: suppres
 static volatile bool    s_persist_pending = false;
 static volatile uint8_t s_persist_val     = 0;
 static void bt_mark_persist(bool on){ s_persist_val = bt_persist_encode_enabled(on); s_persist_pending = true; }
+
+// Last connected sink: cached at boot (s_last_sink_stored) so the reconnect
+// choice never touches flash code from the BTstack context, and a persist is
+// requested only when a connection is established to a different sink.
+static bd_addr_t     s_last_sink_stored;
+static bool          s_last_sink_valid = false;
+static bd_addr_t     s_last_sink_req;
+static volatile bool s_last_sink_pending = false;
 static bool s_radio_ok      = false;  // bring-up fully succeeded
 
 // Radio failure after cyw43_arch_init().  In background mode cyw43_arch_init()
@@ -545,12 +554,20 @@ static bool bt_is_bonded(const bd_addr_t addr){
     return found;
 }
 
-// The stored sink to reconnect to at boot: the first bonded device in the
-// BTstack link-key TLV (persisted across power cycles in the dedicated flash
-// bank — see flash_storage.c / CMakeLists.txt).  Returns false when no bond is
-// stored, so the caller degrades to idle/scannable instead of connecting to a
-// hard-coded address.  (One A2DP sink at a time; the first bond is the sink.)
+// The stored sink to reconnect to at boot: the last sink a connection was
+// established to (directory V26) while it is still bonded, else the first
+// bonded device in the BTstack link-key TLV (persisted across power cycles in
+// the dedicated flash bank — see flash_storage.c / CMakeLists.txt).  Returns
+// false when no bond is stored, so the caller degrades to idle/scannable
+// instead of connecting to a hard-coded address.
 static bool bt_stored_sink(bd_addr_t out){
+    // Prefer the sink last connected to while it is still bonded: BTstack's
+    // link-key iterator walks storage slots in index order, so with several
+    // bonds "first" is not the one the user used last.
+    if (s_last_sink_valid && bt_is_bonded(s_last_sink_stored)){
+        memcpy(out, s_last_sink_stored, 6);
+        return true;
+    }
     btstack_link_key_iterator_t it;
     if (!gap_link_key_iterator_init(&it)) return false;
     bd_addr_t a; link_key_t k; link_key_type_t t;
@@ -759,6 +776,14 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             s_sink_rate_caps = 0;                 // re-learned from this sink's capabilities
             s_rs_state = BT_RS_IDLE;
             memcpy(s_target_addr, address, 6);
+            // Remember it as the boot-reconnect target (persisted by the main
+            // loop, and only when it differs from the stored one).
+            if (!s_last_sink_valid || memcmp(s_last_sink_stored, address, 6) != 0){
+                memcpy(s_last_sink_req, address, 6);
+                memcpy(s_last_sink_stored, address, 6);
+                s_last_sink_valid = true;
+                s_last_sink_pending = true;
+            }
             media_tracker.a2dp_cid = cid;
             media_tracker.volume = 32;
             printf("[bt] A2DP connected to %s, cid 0x%02x\n", bd_addr_to_str(address), cid);
@@ -969,6 +994,7 @@ void bt_output_init(void){
     // device whose stored config has BT on brings the radio up and reconnects to
     // the stored sink.  This is the boot read; no persist (no change).
     s_user_enabled = preset_get_bt_enabled();
+    s_last_sink_valid = preset_get_bt_last_sink(s_last_sink_stored);
     printf("[bt] boot enable state: %s (persisted)\n", s_user_enabled ? "on" : "off");
 
     // Bring up USB-serial (CDC) for the [btm] metrics line + BTstack logs.
@@ -1365,6 +1391,13 @@ uint8_t bt_output_sink_rate_caps(void){
 
 bool bt_output_user_enabled(void){
     return s_user_enabled;
+}
+
+bool bt_output_consume_last_sink_request(uint8_t addr[6]){
+    if (!s_last_sink_pending) return false;
+    s_last_sink_pending = false;
+    memcpy(addr, s_last_sink_req, 6);
+    return true;
 }
 
 bool bt_output_consume_persist_request(bool *on){

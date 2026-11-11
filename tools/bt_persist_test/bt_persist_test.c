@@ -154,6 +154,7 @@ typedef struct {
 typedef struct {
     uint8_t  data[DIR_V25_DATA_LEN];        // byte-identical prefix
     uint8_t  bt_enabled;                    // V26 tail-append
+    uint8_t  bt_last_sink[6];               // V26: boot-reconnect target
 } DirV26Mirror;
 
 // The migration rule, isolated: copy the V25 data region into a zeroed V26
@@ -167,8 +168,9 @@ static void dir_migrate_v25_to_v26(const DirV25Mirror *v25, DirV26Mirror *out) {
 static void test_directory_migration(void) {
     // Tail-append: V26 is exactly one byte larger and the prefix offset of the
     // bt_enabled field is the full V25 data length (nothing shifted).
-    CHECK_EQ_U(sizeof(DirV26Mirror), sizeof(DirV25Mirror) + 1u);
+    CHECK_EQ_U(sizeof(DirV26Mirror), sizeof(DirV25Mirror) + 7u);
     CHECK_EQ_U(offsetof(DirV26Mirror, bt_enabled), DIR_V25_DATA_LEN);
+    CHECK_EQ_U(offsetof(DirV26Mirror, bt_last_sink), DIR_V25_DATA_LEN + 1u);
 
     // Build a V25 image with a recognizable prefix pattern.
     DirV25Mirror v25;
@@ -180,8 +182,9 @@ static void test_directory_migration(void) {
 
     // Every pre-existing byte survives unchanged (existing presets stay valid).
     CHECK(memcmp(v26.data, v25.data, DIR_V25_DATA_LEN) == 0);
-    // BT defaults off after migration.
+    // BT defaults off after migration, with no last sink recorded.
     CHECK(bt_persist_decode_enabled(v26.bt_enabled) == false);
+    for (unsigned i = 0; i < 6; i++) CHECK_EQ_U(v26.bt_last_sink[i], 0u);
 
     // A V26 image round-trips bt_enabled.
     DirV26Mirror saved;

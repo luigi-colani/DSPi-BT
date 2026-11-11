@@ -33,6 +33,9 @@ bool bt_output_user_enabled(void);
 // the device-global directory; the caller (main loop) performs the flash write
 // inside its flash-write bracket.  Returns false when nothing is pending.
 bool bt_output_consume_persist_request(bool *on);
+// Main loop: a newly connected sink to persist as the boot-reconnect target
+// (preset_set_bt_last_sink, inside the flash write bracket).
+bool bt_output_consume_last_sink_request(uint8_t addr[6]);
 
 // Drive the Pico 2 W onboard LED (wired to the CYW43 radio).  Safe before the
 // radio is up (no-op until cyw43_arch_init() has run).  Used for the boot
@@ -69,6 +72,16 @@ bool bt_get_scan_result(uint8_t index, BtScanResult *out);
 // (Task 3 review) to avoid confusion with bt_output_is_enabled() — Task 5's
 // REQ_BT enable/disable caller must use THIS name.
 bool bt_radio_standdown(bool on, uint8_t *stood_down_mask);
+
+// Configured enable of a stood-down output (bit = BT_STOODDOWN_* from
+// bt_exclusion.h) while the radio holds its resources (vendor_commands.c).
+// Save / collect / host-report paths OR this into the live enable, so the
+// temporary stand-down never leaks into a preset or host config; apply paths
+// call bt_standdown_set_intent() instead of enabling the hardware, so what BT
+// off restores follows config changes made while BT was on.
+#include "bt_exclusion.h"
+bool bt_standdown_holds(uint8_t bit);
+void bt_standdown_set_intent(uint8_t bit, bool on);
 
 // Pipeline-reset bracket wrappers (implemented in main.c, where the static
 // prepare_pipeline_reset/complete_pipeline_reset + pipeline_reset_ready live).

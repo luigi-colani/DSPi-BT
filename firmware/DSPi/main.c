@@ -2400,6 +2400,14 @@ int main(void) {
                     preset_set_bt_enabled(bt_on);
                     complete_flash_write_operation_full();
                 }
+                // Boot-reconnect target: requested only when a connection is
+                // established to a different sink than the stored one.
+                uint8_t sink[6];
+                if (bt_output_consume_last_sink_request(sink)) {
+                    prepare_flash_write_operation();
+                    preset_set_bt_last_sink(sink);
+                    complete_flash_write_operation_full();
+                }
             }
 #endif
 

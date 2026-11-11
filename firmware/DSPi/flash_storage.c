@@ -692,12 +692,13 @@ typedef struct __attribute__((packed)) {
 #define FLASH_OUTPUT_LATENCY_CONFIG_VERSION 1
 
 //
-// V26 appends a single device-global Bluetooth-output enable byte (bt_enabled;
-// DSPI_BT / Pico 2 W).  It is the last directory member, so every earlier field
-// keeps its offset; the V25->V26 migration copies the whole V25 data block and
-// leaves bt_enabled at the zero-filled default (BT off, the valid default — see
-// bt_persist.h).  Older migrations reach V26 the same way (the byte stays 0
-// from the dir_cache memset).
+// V26 appends the device-global Bluetooth-output state (DSPI_BT / Pico 2 W):
+// the enable byte (bt_enabled) and the last connected sink (bt_last_sink, the
+// boot-reconnect target).  They are the last directory members, so every
+// earlier field keeps its offset; the V25->V26 migration copies the whole V25
+// data block and leaves both at the zero-filled default (BT off, no last sink
+// — see bt_persist.h).  Older migrations reach V26 the same way (the bytes stay
+// 0 from the dir_cache memset).
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -780,6 +781,10 @@ typedef struct __attribute__((packed)) {
     // device-global here.  All-zero = BT disabled (bt_persist.h: the valid
     // default), so a fresh directory and every older migration need no seeding.
     uint8_t bt_enabled;                      // 0/1; 0 = off (default)
+    // Last sink an A2DP connection was established to (BD_ADDR, textual
+    // order); the boot reconnect prefers it while it is still bonded.  All
+    // zeros = none recorded (fall back to the first stored bond).
+    uint8_t bt_last_sink[6];
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -1308,8 +1313,8 @@ _Static_assert(sizeof(PresetDirectory_v20) == 3327,
 #define PRESET_DIRECTORY_V25_SIZE (PRESET_DIRECTORY_V24_SIZE + 32)
 _Static_assert(offsetof(PresetDirectory, bt_enabled) == PRESET_DIRECTORY_V25_SIZE,
                "V26 Bluetooth enable byte must directly follow the V25 layout");
-_Static_assert(sizeof(PresetDirectory) == PRESET_DIRECTORY_V25_SIZE + 1,
-               "V26 directory must be exactly one byte (bt_enabled) larger than V25");
+_Static_assert(sizeof(PresetDirectory) == PRESET_DIRECTORY_V25_SIZE + 7,
+               "V26 directory must be exactly 7 bytes (bt_enabled + bt_last_sink) larger than V25");
 
 #define DIR_VERSION_CURRENT  26
 
@@ -3209,6 +3214,9 @@ static void io_config_from_live(FlashOutputConfig *cfg) {
     // ADAT bulk output (RP2350 only; zeros on RP2040 where the feature is absent).
 #if PICO_RP2350
     cfg->adat_enabled = adat_output_config_enabled() ? 1 : 0;
+#if DSPI_BT
+    if (bt_standdown_holds(BT_STOODDOWN_ADAT)) cfg->adat_enabled = 1;   // stood down for the radio
+#endif
     cfg->adat_pin     = adat_output_pin();
 #else
     cfg->adat_enabled = 0;
@@ -3601,7 +3609,10 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
         // down so the CYW43 radio could claim its PIO SM1 + DMA.  A stored
         // output-config must not re-enable it while the radio holds those
         // resources; the stored intent is reapplied once the radio is disabled.
-        if (adat_en && bt_radio_resources_held()) adat_en = false;
+        if (bt_radio_resources_held()) {
+            bt_standdown_set_intent(BT_STOODDOWN_ADAT, adat_en);   // restored at BT off
+            adat_en = false;
+        }
 #endif
         adat_output_set_config(adat_en, pin);
         if (adat_output_config_enabled() == adat_out_was_en &&
@@ -3777,6 +3788,11 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     }
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         slot->matrix_outputs[out].enabled = matrix_mixer.outputs[out].enabled;
+#if DSPI_BT
+        // A PDM sub stood down for the radio is still configured on.
+        if (out == NUM_OUTPUT_CHANNELS - 1 && bt_standdown_holds(BT_STOODDOWN_PDM))
+            slot->matrix_outputs[out].enabled = 1;
+#endif
         slot->matrix_outputs[out].mute = matrix_mixer.outputs[out].mute;
         slot->matrix_outputs[out].gain_db = matrix_mixer.outputs[out].gain_db;
         slot->matrix_outputs[out].delay_ms = matrix_mixer.outputs[out].delay_ms;
@@ -3809,6 +3825,9 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     // zeros on RP2040 where the feature is absent).
 #if PICO_RP2350
     slot->adat_enabled = adat_output_config_enabled() ? 1 : 0;
+#if DSPI_BT
+    if (bt_standdown_holds(BT_STOODDOWN_ADAT)) slot->adat_enabled = 1;   // stood down for the radio
+#endif
     slot->adat_pin     = adat_output_pin();
 #else
     slot->adat_enabled = 0;
@@ -4275,8 +4294,10 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         // not bring the PDM output (the last output) back up.  Mirrors the
         // REQ_SET_OUTPUT_ENABLE and bulk-apply guards; the stored enable is
         // honoured again once the radio is disabled.
-        if (out == NUM_OUTPUT_CHANNELS - 1 && out_enabled && bt_radio_resources_held())
+        if (out == NUM_OUTPUT_CHANNELS - 1 && bt_radio_resources_held()) {
+            bt_standdown_set_intent(BT_STOODDOWN_PDM, out_enabled);   // restored at BT off
             out_enabled = false;
+        }
 #endif
         matrix_mixer.outputs[out].enabled = out_enabled ? 1 : 0;
         matrix_mixer.outputs[out].mute = slot->matrix_outputs[out].mute;
@@ -4865,6 +4886,22 @@ void preset_set_bt_enabled(bool on) {
 bool preset_get_bt_enabled(void) {
     dir_ensure();
     return bt_persist_decode_enabled(dir_cache.bt_enabled);
+}
+
+// Last connected Bluetooth sink (DIR V26+).  Same rules as the enable byte:
+// main loop only, writes the directory sector only when the address changes.
+void preset_set_bt_last_sink(const uint8_t addr[6]) {
+    dir_ensure();
+    if (memcmp(dir_cache.bt_last_sink, addr, 6) == 0) return;   // no change -> no flash write
+    memcpy(dir_cache.bt_last_sink, addr, 6);
+    dir_flush();
+}
+
+bool preset_get_bt_last_sink(uint8_t out[6]) {
+    static const uint8_t none[6] = {0};
+    dir_ensure();
+    memcpy(out, dir_cache.bt_last_sink, 6);
+    return memcmp(out, none, 6) != 0;
 }
 
 // Control-interface (UART/I2C) persistence.  Mirrors preset_set_dac_hw_mute:

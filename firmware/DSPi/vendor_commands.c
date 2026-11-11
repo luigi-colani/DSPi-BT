@@ -417,10 +417,14 @@ static void bt_pdm_set_output_enabled(bool en) {
 #endif
         __sev();   // Wake Core 1 to pick up the mode change
     }
-    uint8_t v = en ? 1 : 0;
-    notify_param_write((uint16_t)(offsetof(WireBulkParams, outputs)
-        + (uint16_t)pdm * sizeof(WireOutputChannel)
-        + offsetof(WireOutputChannel, enabled)), 1, &v);
+    // No PARAM_CHANGED: the stand-down is a runtime override, the configured
+    // enable a host sees is unchanged (bt_standdown_holds).
+}
+
+static bool bt_core1_eq_busy(void) {
+    for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++)
+        if (matrix_mixer.outputs[i].enabled) return true;
+    return false;
 }
 
 bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
@@ -441,8 +445,6 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
             // Deferred, mute-bracketed teardown serviced by the main loop
             // (adat_output_config_dirty); click-free per the ADAT spec.
             adat_output_set_config(false, adat_output_pin());
-            uint8_t v = 0;
-            notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
         }
 #endif
         s_bt_standdown_mask = mask;
@@ -452,10 +454,7 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
         if (mask & BT_STOODDOWN_PDM) {
             // Honour the PDM<->EQ-worker interlock: only restore the PDM sub if
             // no Core-1 EQ output grabbed the slot while BT held it.
-            bool eq_busy = false;
-            for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++)
-                if (matrix_mixer.outputs[i].enabled) { eq_busy = true; break; }
-            if (!eq_busy) bt_pdm_set_output_enabled(true);
+            if (!bt_core1_eq_busy()) bt_pdm_set_output_enabled(true);
             else          mask &= (uint8_t)~BT_STOODDOWN_PDM;  // left disabled
         }
 #if PICO_RP2350
@@ -469,10 +468,11 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
             uint8_t apin = adat_output_pin();
             if (is_valid_gpio_pin(apin) && !is_pin_in_use(apin, 0xFF)) {
                 adat_output_set_config(true, apin);
-                uint8_t v = 1;
-                notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
             } else {
                 mask &= (uint8_t)~BT_STOODDOWN_ADAT;   // left disabled
+                // The configured enable a host saw (bt_standdown_holds) drops.
+                uint8_t v = 0;
+                notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
             }
         }
 #endif
@@ -480,6 +480,26 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask) {
     }
     if (stood_down_mask) *stood_down_mask = mask;
     return mask != 0;
+}
+
+// While the radio holds the PIO1 resources, the stood-down outputs' CONFIGURED
+// enable lives in s_bt_standdown_mask: the restore above re-enables exactly
+// those.  Saves and host reports read it (bt_standdown_holds) and config apply
+// paths write it (bt_standdown_set_intent) instead of touching the hardware,
+// so the temporary stand-down never leaks into a saved preset / host config,
+// and a change made while BT is on is what BT-off restores.
+bool bt_standdown_holds(uint8_t bit) {
+    if (!bt_radio_resources_held() || !(s_bt_standdown_mask & bit)) return false;
+    // PDM shares Core 1 with the EQ worker: the restore leaves PDM off if an
+    // EQ output took Core 1 meanwhile, so it does not count as enabled then.
+    if (bit == BT_STOODDOWN_PDM && bt_core1_eq_busy()) return false;
+    return true;
+}
+
+void bt_standdown_set_intent(uint8_t bit, bool on) {
+    if (!bt_radio_resources_held()) return;
+    if (on) s_bt_standdown_mask |= bit;
+    else    s_bt_standdown_mask &= (uint8_t)~bit;
 }
 #endif // DSPI_BT
 
@@ -1363,6 +1383,12 @@ static bool vendor_handle_set_body(tusb_control_request_t const *req) {
                     }
                 }
 
+#if DSPI_BT
+                // Disabling the stood-down PDM while BT holds it: record the
+                // new configured state so BT-off does not bring it back.
+                if (!want_enable && out == NUM_OUTPUT_CHANNELS - 1)
+                    bt_standdown_set_intent(BT_STOODDOWN_PDM, false);
+#endif
                 matrix_mixer.outputs[out].enabled = want_enable ? 1 : 0;
 
                 // Determine new Core 1 mode and transition
@@ -2743,6 +2769,10 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
                 uint8_t out = (uint8_t)setup->wValue;
                 if (out < NUM_OUTPUT_CHANNELS) {
                     resp_buf[0] = matrix_mixer.outputs[out].enabled;
+#if DSPI_BT
+                    if (out == NUM_OUTPUT_CHANNELS - 1 && bt_standdown_holds(BT_STOODDOWN_PDM))
+                        resp_buf[0] = 1;   // configured on; stood down for the radio
+#endif
                     vendor_send_response(resp_buf, 1);
                     return true;
                 }
@@ -3809,9 +3839,16 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
 #else
                 uint8_t value = setup->wValue & 0xFF;
                 uint8_t status;
+                // Compare against the CONFIGURED enable: while the radio holds
+                // ADAT stood down it reads as on (bt_standdown_holds), so a
+                // disable then reaches the branch that clears that intent.
+                bool adat_cfg_on = adat_output_config_enabled();
+#if DSPI_BT
+                adat_cfg_on = adat_cfg_on || bt_standdown_holds(BT_STOODDOWN_ADAT);
+#endif
                 if (value > 1) {
                     status = PIN_CONFIG_INVALID_PARAM;
-                } else if (value == (adat_output_config_enabled() ? 1 : 0)) {
+                } else if (value == (adat_cfg_on ? 1 : 0)) {
                     status = PIN_CONFIG_SUCCESS;  // No-op: already in this state
                 } else if (value != 0) {
                     // Enabling from disabled: validate the configured ADAT pin.
@@ -3836,6 +3873,9 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
                     }
                 } else {
                     // Disabling: always allowed.
+#if DSPI_BT
+                    bt_standdown_set_intent(BT_STOODDOWN_ADAT, false);
+#endif
                     adat_output_set_config(false, adat_output_pin());
                     status = PIN_CONFIG_SUCCESS;
                 }
@@ -3852,6 +3892,9 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
             case REQ_GET_ADAT_ENABLE: {
 #if PICO_RP2350
                 resp_buf[0] = adat_output_config_enabled() ? 1 : 0;
+#if DSPI_BT
+                if (bt_standdown_holds(BT_STOODDOWN_ADAT)) resp_buf[0] = 1;   // stood down for the radio
+#endif
 #else
                 resp_buf[0] = 0;
 #endif

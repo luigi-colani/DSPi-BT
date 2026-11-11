@@ -126,6 +126,11 @@ const char *preset_stored_device_name(void);
 // cache.  Read at boot to seed the live radio-enable state; default 0 (off).
 void preset_set_bt_enabled(bool on);
 bool preset_get_bt_enabled(void);
+// Last connected Bluetooth sink (DIR V26+; boot-reconnect target).  Setter:
+// main loop only, inside a flash write bracket, writes only on change.  Getter
+// returns false when none is recorded (all zeros).
+void preset_set_bt_last_sink(const uint8_t addr[6]);
+bool preset_get_bt_last_sink(uint8_t out[6]);
 
 // External control-interface config (UART/I2C, board-level, directory-stored,
 // V6+).  Setter is synchronous and main-loop only; a NULL pointer leaves that
