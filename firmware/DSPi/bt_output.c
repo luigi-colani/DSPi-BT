@@ -270,6 +270,18 @@ static volatile bool    s_persist_pending = false;
 static volatile uint8_t s_persist_val     = 0;
 static void bt_mark_persist(bool on){ s_persist_val = bt_persist_encode_enabled(on); s_persist_pending = true; }
 static bool s_radio_ok      = false;  // bring-up fully succeeded
+
+// Radio failure after cyw43_arch_init().  In background mode cyw43_arch_init()
+// succeeds without talking to the chip; a dead / non-starting CYW43 only shows
+// up when HCI powers on (hci_power_control() error + BTSTACK_EVENT_POWERON_FAILED)
+// or as an HCI init that never reaches WORKING.  Every CYW43 call on such a
+// chip retries the (blocking) chip start, so nothing may touch it afterwards —
+// the LED heartbeat included.
+#define BT_RADIO_UP_TIMEOUT_MS 10000u
+static bool          s_led_ok             = false;  // HCI reached WORKING: LED may be driven
+static volatile bool s_radio_fail_pending = false;  // power-on failed (any context)
+static uint32_t      s_power_on_ms        = 0;      // HCI_POWER_ON issued, not WORKING yet (0 = idle)
+static bool          s_radio_failed       = false;  // BT dropped to off this session by a failure
 static volatile bool s_hci_working = false;
 static volatile bool s_inquiry_active = false;  // inquiry running
 static volatile bool s_scanning = false;        // inquiry + name resolution
@@ -564,6 +576,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 break;
             }
             s_hci_working = true;
+            s_led_ok = true;               // chip proven alive
+            s_power_on_ms = 0;
+            s_radio_failed = false;
             // Reconnect-on-boot (Task 6): auto-connect to the STORED bonded sink
             // (the persisted link key) ONLY while no vendor command has directed
             // the link.  Graceful fallback: with no stored bond, stay idle and
@@ -590,6 +605,11 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             } else {
                 printf("[bt] HCI working (awaiting vendor-command connect)\n");
             }
+            break;
+        case BTSTACK_EVENT_POWERON_FAILED:
+            // Transport open failed (chip did not start).  Handled in the main
+            // loop (bt_check_radio_failure) — never touch the chip from here.
+            s_radio_fail_pending = true;
             break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             hci_event_pin_code_request_get_bd_addr(packet, address);
@@ -881,6 +901,52 @@ static void bt_restore_outputs(void){
     printf("[bt] outputs restored mask=0x%02x\n", restored);
 }
 
+// Power the controller on and arm the bring-up watchdog.  A synchronous
+// failure (transport open) is flagged here; the async one arrives as
+// BTSTACK_EVENT_POWERON_FAILED.  Main loop only.
+static void bt_power_on(void){
+    s_radio_fail_pending = false;
+    s_power_on_ms = to_ms_since_boot(get_absolute_time()) | 1u;
+    cyw43_arch_lwip_begin();
+    int rc = hci_power_control(HCI_POWER_ON);
+    cyw43_arch_lwip_end();
+    if (rc) s_radio_fail_pending = true;
+}
+
+// Radio did not come up: power HCI back down, stop touching the chip, give
+// the wired outputs back and report BT_ERR_RADIO.  BT drops to off for this
+// session only (not persisted — the next boot retries; a host "enable" retries
+// now).  Main loop only, pipeline reset-ready.
+static void bt_radio_fail(const char *why){
+    printf("[bt] radio failed: %s; BT off, outputs restored\n", why);
+    s_radio_fail_pending = false;
+    s_power_on_ms = 0;
+    s_led_ok = false;
+    s_bt_enabled = false;
+    cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_OFF); cyw43_arch_lwip_end();
+    s_hci_working = false; s_connecting = false; s_a2dp_connected = false;
+    s_scanning = false; s_inquiry_active = false;
+    s_connect_pending = s_disconnect_pending = s_forget_pending = s_scan_pending = false;
+    s_codec = BT_CODEC_NONE;
+    s_user_enabled = false;
+    s_radio_failed = true;
+    s_last_status = BT_ERR_RADIO;
+    bt_restore_outputs();
+}
+
+// Returns true when a radio failure is being handled (skip the rest of this
+// tick).  Failure = power-on error, or HCI not WORKING within the timeout.
+static bool bt_check_radio_failure(void){
+    if (!s_user_enabled){ s_radio_fail_pending = false; s_power_on_ms = 0; return false; }
+    bool timed_out = s_power_on_ms && !s_hci_working &&
+        (to_ms_since_boot(get_absolute_time()) - s_power_on_ms) > BT_RADIO_UP_TIMEOUT_MS;
+    if (!s_radio_fail_pending && !timed_out) return false;
+    if (!bt_pipeline_reset_ready()) return true;      // restore needs a safe point
+    bt_radio_fail(s_radio_fail_pending ? "controller power-on failed"
+                                       : "HCI did not reach WORKING in time");
+    return true;
+}
+
 static void bt_do_disconnect(void){
     if (!(s_a2dp_connected || s_connecting)) return;
     if (media_tracker.a2dp_cid){
@@ -907,6 +973,10 @@ static void bt_service_commands(void){
         bool want = s_enable_req;
         if (want == s_user_enabled){
             s_enable_pending = false;
+            // After a radio failure BT is off for this session but still
+            // persisted on (so the next boot retries); an explicit "off"
+            // must reach flash too.
+            if (!want && s_radio_failed){ s_radio_failed = false; bt_mark_persist(false); }
         } else if (bt_pipeline_reset_ready()){
             s_enable_pending = false;
             s_user_directed = true;
@@ -920,6 +990,7 @@ static void bt_service_commands(void){
                 s_connect_pending = s_disconnect_pending = s_forget_pending = s_scan_pending = false;
                 cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_OFF); cyw43_arch_lwip_end();
                 s_hci_working = false; s_connecting = false; s_a2dp_connected = false;
+                s_power_on_ms = 0; s_radio_fail_pending = false;
                 s_codec = BT_CODEC_NONE;
                 media_tracker.a2dp_cid = 0; media_tracker.avrcp_cid = 0; media_tracker.stream_opened = 0;
                 s_user_enabled = false;
@@ -935,7 +1006,7 @@ static void bt_service_commands(void){
                 s_user_enabled = true;
                 bt_mark_persist(true);                 // persist BT on (deferred)
                 s_last_status = BT_ERR_NONE;
-                cyw43_arch_lwip_begin(); hci_power_control(HCI_POWER_ON); cyw43_arch_lwip_end();  // -> BTSTACK_EVENT_STATE WORKING
+                bt_power_on();                         // -> BTSTACK_EVENT_STATE WORKING
                 printf("[bt] enabled (stand-down mask=0x%02x)\n", mask);
             }
         }
@@ -1075,6 +1146,7 @@ void bt_request_forget(const uint8_t addr[6]){
 void bt_output_poll(void){
     if (s_bringup_done){
         if (s_radio_ok){
+            if (bt_check_radio_failure()) return;
             bt_service_commands();
             bt_notify_if_changed();
         }
@@ -1155,9 +1227,7 @@ void bt_output_poll(void){
     // Power on — the background async context drives everything from here,
     // including the auto-connect on HCI_STATE_WORKING.
     s_radio_ok = true;
-    cyw43_arch_lwip_begin();
-    hci_power_control(HCI_POWER_ON);
-    cyw43_arch_lwip_end();
+    bt_power_on();
     printf("[bt] A2DP source init done, sink=%s\n", device_addr_string);
 }
 
@@ -1182,7 +1252,9 @@ bool __not_in_flash_func(bt_output_is_enabled)(void){
 }
 
 void bt_output_led(bool on){
-    if (!s_cyw43_ready) return;
+    // Only once HCI reached WORKING: on a dead chip every CYW43 call retries
+    // the blocking chip start and would stall the main loop.
+    if (!s_cyw43_ready || !s_led_ok) return;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
 }
 

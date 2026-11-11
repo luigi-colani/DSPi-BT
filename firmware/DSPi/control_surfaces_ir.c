@@ -125,6 +125,11 @@ static uint32_t s_learn_code;
 static void __not_in_flash_func(cs_ir_edge_irq)(void) {
     uint32_t now = time_us_32();
     uint8_t pin = s_pin;
+    // IO_IRQ_BANK0 is shared (see cs_ir_attach): this runs for every bank-0
+    // GPIO IRQ on this core, e.g. the CYW43 host-wake line on a Pico 2 W.
+    // Only an edge on our own pin is ours to consume and acknowledge.
+    if (!(gpio_get_irq_event_mask(pin) & (GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE)))
+        return;
     gpio_acknowledge_irq(pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);  // inline
     uint32_t dur = now - s_last_edge_us;
     s_last_edge_us = now;
@@ -151,9 +156,16 @@ void cs_ir_attach(uint8_t pin, bool invert) {
     s_frame_n = 0; s_in_frame = false; s_frame_overflow = false;
     s_held = false; s_evq_n = 0;
     s_last_edge_us = time_us_32();
-    irq_set_exclusive_handler(IO_IRQ_BANK0, cs_ir_edge_irq);
+    // Shared per-pin raw handler, never an exclusive IO_IRQ_BANK0 handler: the
+    // CYW43 driver (Pico 2 W Bluetooth) hangs its host-wake handler on the
+    // same IRQ the same way.  An exclusive handler next to a shared one is a
+    // hard_assert -> panic in release builds whichever registers second
+    // (with both persisted, a boot loop).
+    gpio_add_raw_irq_handler(pin, cs_ir_edge_irq);
     // Lowest priority: durations come from timestamps, so latency only has
     // to stay under the shortest period (~440 µs), never under the audio path.
+    // (Applies to the whole bank IRQ; the CYW43 host-wake handler only
+    // schedules work, so it tolerates this too.)
     irq_set_priority(IO_IRQ_BANK0, 0xC0);
     gpio_set_irq_enabled(pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
     irq_set_enabled(IO_IRQ_BANK0, true);
@@ -162,10 +174,10 @@ void cs_ir_attach(uint8_t pin, bool invert) {
 
 void cs_ir_detach(void) {
     if (!s_attached) return;
-    irq_set_enabled(IO_IRQ_BANK0, false);
+    // Leave IO_IRQ_BANK0 itself enabled: other pins' handlers (CYW43) share it.
     gpio_set_irq_enabled(s_pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, false);
     gpio_acknowledge_irq(s_pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
-    irq_remove_handler(IO_IRQ_BANK0, cs_ir_edge_irq);
+    gpio_remove_raw_irq_handler(s_pin, cs_ir_edge_irq);
     s_attached = false;
     s_held = false;
     s_evq_n = 0;
