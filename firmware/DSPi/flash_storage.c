@@ -4847,6 +4847,7 @@ uint8_t preset_set_input_source_names(uint8_t mask,
         dir_cache.device_name[DEVICE_NAME_LEN - 1] = '\0';
     }
     return dir_flush() == 0 ? PRESET_OK : PRESET_ERR_FLASH_WRITE;
+}
 
 // Device-global Bluetooth-output enable persistence (DIR V26+).  Mirrors
 // preset_set_dac_hw_mute: synchronous, main-loop only, writes the directory

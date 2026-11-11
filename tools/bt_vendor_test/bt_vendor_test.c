@@ -59,8 +59,24 @@ int main(void) {
     CHECK(st3.state == 5 && st3.codec == 1 && st3.volume == 100 && st3.flags == 0x05 &&
           st3.sample_rate == 44100 && memcmp(st3.addr, st.addr, 6) == 0);
 
-    // ---- command IDs unique & unclaimed-by-convention ----
-    CHECK(BT_REQ_FIRST == 0x20 && BT_REQ_LAST == 0x26);
+    // ---- REQ_BT (0x00) op encoding and SETUP-stage validation ----
+    CHECK(BT_OP_ENABLE == 0x01 && BT_OP_SCAN == 0x02 && BT_OP_CONNECT == 0x03 &&
+          BT_OP_DISCONNECT == 0x04 && BT_OP_FORGET == 0x05);
+    CHECK(BT_GET_STATUS == 0x01 && BT_GET_SCAN_RESULT == 0x02);
+    CHECK(bt_set_request_valid(BT_OP_ENABLE, 1));
+    CHECK(bt_set_request_valid(BT_OP_SCAN, 1));
+    CHECK(bt_set_request_valid(BT_OP_DISCONNECT, 1));   // 1 dummy byte keeps it a SET
+    CHECK(bt_set_request_valid(BT_OP_CONNECT, 6));
+    CHECK(bt_set_request_valid(BT_OP_FORGET, 6));
+    CHECK(bt_set_request_valid(BT_OP_CONNECT, 8));      // longer payload is fine
+    CHECK(!bt_set_request_valid(BT_OP_ENABLE, 0));      // short payload -> STALL
+    CHECK(!bt_set_request_valid(BT_OP_DISCONNECT, 0));
+    CHECK(!bt_set_request_valid(BT_OP_CONNECT, 5));
+    CHECK(!bt_set_request_valid(BT_OP_FORGET, 5));
+    CHECK(!bt_set_request_valid(0x00, 1));              // unknown ops -> STALL
+    CHECK(!bt_set_request_valid(0x06, 6));
+    CHECK(!bt_set_request_valid(0xFF, 6));
+    CHECK(!bt_set_request_valid(0x0100 | BT_OP_ENABLE, 1));   // nonzero high byte
 
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("bt_vendor_test: all passed\n");

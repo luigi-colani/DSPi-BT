@@ -10,21 +10,59 @@
 // are never memcpy'd from a native struct, so layout/padding/host endianness
 // cannot leak onto the wire).
 //
-// Vendor request IDs (0x20..0x26; the 0x00-0x2F range was unused):
-//   0x20 REQ_BT_SET_ENABLE     SET  payload u8 (0 = off, 1 = on)         deferred
-//   0x21 REQ_BT_SCAN           SET  payload u8 (1 = start, 0 = stop)     deferred
-//   0x22 REQ_BT_GET_SCAN_RESULT GET wValue = index; 32-byte BtScanResult
-//   0x23 REQ_BT_CONNECT        SET  payload 6-byte BD_ADDR (wire order = textual order)  deferred
-//   0x24 REQ_BT_DISCONNECT     GET-path no-payload cmd (wLength>=1), returns status byte 0   deferred
-//   0x25 REQ_BT_FORGET         SET  payload 6-byte BD_ADDR (drops the bond)  deferred
-//   0x26 REQ_BT_GET_STATUS     GET  16-byte BtStatus
+// Vendor request: ONE bRequest, REQ_BT = 0x00 (config.h), in both directions.
+// Upstream v1.1.6 uses 0x20..0x2F (Control Surfaces, subharmonics), and 0x40 /
+// 0x41 are taken on an upstream side branch, so BT lives on the otherwise
+// unused 0x00 and selects the operation through wValue.
+//
+//   OUT (bmRequestType 0x41): wValue = op (low byte), high byte must be 0
+//     0x01 BT_OP_ENABLE      payload u8 (0 = off, 1 = on)                 deferred
+//     0x02 BT_OP_SCAN        payload u8 (1 = start, 0 = stop)             deferred
+//     0x03 BT_OP_CONNECT     payload 6-byte BD_ADDR (wire order = textual order)  deferred
+//     0x04 BT_OP_DISCONNECT  payload 1 dummy byte (0) so it stays a SET   deferred
+//     0x05 BT_OP_FORGET      payload 6-byte BD_ADDR (drops the bond)      deferred
+//   IN (bmRequestType 0xC1):
+//     wValue = 0x0001                  BT_GET_STATUS       -> 16-byte BtStatus
+//     wValue = (index << 8) | 0x0002   BT_GET_SCAN_RESULT  -> 32-byte BtScanResult
+//
+// An unknown op, a nonzero OUT high byte or a short payload STALLs (OUT at the
+// SETUP stage, see bt_set_request_valid()); builds without DSPI_BT STALL every
+// 0x00 request, so a host detects BT support with the IN status request.
 // ----------------------------------------------------------------------------
 
 #include <stdint.h>
 #include <string.h>
 
-#define BT_REQ_FIRST  0x20
-#define BT_REQ_LAST   0x26
+// OUT operations (wValue low byte; high byte 0).
+#define BT_OP_ENABLE        0x01
+#define BT_OP_SCAN          0x02
+#define BT_OP_CONNECT       0x03
+#define BT_OP_DISCONNECT    0x04
+#define BT_OP_FORGET        0x05
+
+// IN selectors (wValue low byte; high byte = scan-result index).
+#define BT_GET_STATUS       0x01
+#define BT_GET_SCAN_RESULT  0x02
+
+// Minimum OUT payload for an op; 0 = unknown op.
+static inline uint16_t bt_op_min_payload(uint8_t op) {
+    switch (op) {
+        case BT_OP_ENABLE:
+        case BT_OP_SCAN:
+        case BT_OP_DISCONNECT: return 1;
+        case BT_OP_CONNECT:
+        case BT_OP_FORGET:     return 6;
+        default:               return 0;
+    }
+}
+
+// Is an OUT REQ_BT request acceptable?  Checked at the SETUP stage (wValue and
+// wLength are known there), so a bad one STALLs instead of being ACKed.
+static inline int bt_set_request_valid(uint16_t wValue, uint16_t wLength) {
+    if (wValue >> 8) return 0;
+    uint16_t need = bt_op_min_payload((uint8_t)wValue);
+    return need != 0 && wLength >= need;
+}
 
 // Connection / stream state (BtStatus.state, NOTIFY_EVT_BT_STATE state byte).
 typedef enum {
@@ -59,7 +97,7 @@ typedef enum {
 #define BT_STATUS_PACKET_SIZE  16
 #define BT_NOTIFY_PAYLOAD_SIZE 14     // bytes following the 4-byte v2 header
 
-// Scan result (REQ_BT_GET_SCAN_RESULT), 32 bytes:
+// Scan result (REQ_BT IN, BT_GET_SCAN_RESULT), 32 bytes:
 //  0..5  addr   6  rssi (int8)   7  flags   8..11 cod (LE, 24 bit used)
 // 12 index  13 count (total results)  14..31 name (NUL-terminated, UTF-8)
 typedef struct {
@@ -72,7 +110,7 @@ typedef struct {
     char     name[BT_SCAN_NAME_LEN];
 } BtScanResult;
 
-// Status (REQ_BT_GET_STATUS), 16 bytes:
+// Status (REQ_BT IN, BT_GET_STATUS), 16 bytes:
 //  0 state  1 flags  2 codec  3 volume(0..127)  4..9 addr (connected/target)
 // 10..13 sample_rate (LE Hz, 0 = none)  14 scan_count  15 last_status
 typedef struct {

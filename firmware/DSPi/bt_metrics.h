@@ -7,10 +7,11 @@
  * the audio callback or the FIFO, and that SBC encoding stays within budget.
  *
  * Fields:
- *   audio_callback_overruns — output-path audio-callback overruns (the shared
- *       `spdif_overruns` counter: the audio/USB callback could not obtain an
- *       output buffer because the pool was full, i.e. the system fell behind).
- *       The pass criterion is zero of these at steady state.
+ *   audio_callback_overruns — USB audio intake overruns (the USB ring's
+ *       overrun_count: a packet arrived while the main loop had not drained
+ *       the ring, i.e. the system fell behind).  Upstream v1.1.6 removed the
+ *       output producer pools and their `spdif_overruns` counter this used to
+ *       mirror.  The pass criterion is zero of these at steady state.
  *   fifo_overflow_frames    — stereo frames the pipeline producer had to drop
  *       because the BT FIFO was full (the A2DP consumer fell behind).
  *   fifo_underflow_frames   — stereo frames the A2DP media timer needed but the

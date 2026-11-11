@@ -66,9 +66,9 @@ bool preset_get_bt_enabled(void);
 // Metrics (see bt_metrics.h)
 // ---------------------------------------------------------------------------
 
-// The audio-callback overrun counter is the shared output-path counter owned
-// by main.c (the USB/audio callback could not get an output buffer).
-extern volatile uint32_t spdif_overruns;
+// The audio intake overrun counter (USB ring overruns, usb_audio.c), reported
+// as BtMetrics.audio_callback_overruns; see bt_metrics.h.
+uint32_t usb_audio_ring_overrun_count(void);   // usb_audio.c; forward-declared (no config.h)
 
 static volatile uint32_t s_sbc_encode_us_last = 0;
 static volatile uint32_t s_sbc_encode_us_max  = 0;
@@ -122,7 +122,7 @@ void bt_fifo_reset(void) {
 BtMetrics bt_output_metrics(void) {
     BtMetrics m;
     bt_fifo_t *f = s_fifo;
-    m.audio_callback_overruns = spdif_overruns;
+    m.audio_callback_overruns = usb_audio_ring_overrun_count();
     m.fifo_overflow_frames    = f ? f->overflow_frames : 0;
     m.fifo_underflow_frames   = f ? f->underflow_frames : 0;
     m.fifo_fill_frames        = f ? f->drift_fill : 0;

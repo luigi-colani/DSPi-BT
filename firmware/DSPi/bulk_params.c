@@ -1054,7 +1054,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // section.  Route the persisted enable intent through the deferred vendor
     // path (flag only; bt_output_poll() performs the radio work from the main
     // loop and persists the new state), so a bulk SET toggles BT exactly like
-    // REQ_BT_ENABLE.  An old host / zero section decodes as "BT off".
+    // REQ_BT / BT_OP_ENABLE.  An old host / zero section decodes as "BT off".
 #if DSPI_BT
     bt_request_enable(bt_persist_decode_enabled(in->bt.enabled));
 #endif

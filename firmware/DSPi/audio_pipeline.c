@@ -34,7 +34,6 @@
 #include "bt_output.h"  // bt_output_is_enabled()
 #include "bt_fifo.h"    // bt_fifo_push() — additive Bluetooth tap (mains)
 #endif
-#include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
 #include "hardware/timer.h"

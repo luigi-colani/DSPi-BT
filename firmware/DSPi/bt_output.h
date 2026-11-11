@@ -67,7 +67,7 @@ bool bt_get_scan_result(uint8_t index, BtScanResult *out);
 // a prepare/complete_pipeline_reset() bracket (see bt_output_poll) so the
 // still-active S/PDIF mains stay click-free.  NB renamed from bt_output_enable
 // (Task 3 review) to avoid confusion with bt_output_is_enabled() — Task 5's
-// REQ_BT_* enable/disable caller must use THIS name.
+// REQ_BT enable/disable caller must use THIS name.
 bool bt_radio_standdown(bool on, uint8_t *stood_down_mask);
 
 // Pipeline-reset bracket wrappers (implemented in main.c, where the static

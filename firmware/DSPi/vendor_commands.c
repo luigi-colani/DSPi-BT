@@ -1936,22 +1936,24 @@ static bool vendor_handle_set_body(tusb_control_request_t const *req) {
         // Each handler only records a request (*_pending in bt_output.c); all
         // BTstack/radio work runs from bt_output_poll() in the main loop.
 #if DSPI_BT
-        case REQ_BT_SET_ENABLE:
-            if (buffer->data_len >= 1) bt_request_enable(vendor_rx_buf[0] != 0);
-            else handled = false;
+        case REQ_BT: {
+            // One opcode, the operation in wValue (bt_proto.h).  USB rejects a
+            // bad op / short payload at SETUP already; this re-check makes the
+            // UART / I2C transports report ERROR for the same requests.
+            if (!bt_set_request_valid(vendor_last_wValue, (uint16_t)buffer->data_len)) {
+                handled = false;
+                break;
+            }
+            switch ((uint8_t)vendor_last_wValue) {
+                case BT_OP_ENABLE:     bt_request_enable(vendor_rx_buf[0] != 0); break;
+                case BT_OP_SCAN:       bt_request_scan(vendor_rx_buf[0] != 0);   break;
+                case BT_OP_CONNECT:    bt_request_connect(vendor_rx_buf);        break;
+                case BT_OP_DISCONNECT: bt_request_disconnect();                  break;
+                case BT_OP_FORGET:     bt_request_forget(vendor_rx_buf);         break;
+                default:               handled = false;                          break;
+            }
             break;
-        case REQ_BT_SCAN:
-            if (buffer->data_len >= 1) bt_request_scan(vendor_rx_buf[0] != 0);
-            else handled = false;
-            break;
-        case REQ_BT_CONNECT:
-            if (buffer->data_len >= 6) bt_request_connect(vendor_rx_buf);
-            else handled = false;
-            break;
-        case REQ_BT_FORGET:
-            if (buffer->data_len >= 6) bt_request_forget(vendor_rx_buf);
-            else handled = false;
-            break;
+        }
 #endif
 
         case REQ_SIGGEN_SET_CONFIG:
@@ -4363,42 +4365,38 @@ static bool vendor_handle_get_body(tusb_control_request_t const *req) {
             }
 
 #if DSPI_BT
-            case REQ_BT_DISCONNECT: {
-                // No-payload command: dispatched on the GET path (like
-                // REQ_TEST_DAC_HW_MUTE).  Records the request and returns a
-                // status byte (0 = accepted); the disconnect runs in the main loop.
-                bt_request_disconnect();
-                resp_buf[0] = 0;
-                vendor_send_response(resp_buf, 1);
-                return true;
-            }
-
-            case REQ_BT_GET_STATUS: {
-                // Snapshot of RAM state only (no stack calls); encoded byte-wise
-                // per bt_proto.h.  Static: outlives the EP0 DATA stage.
-                static uint8_t bt_status_wire[BT_STATUS_PACKET_SIZE];
-                BtStatus st;
-                bt_get_status(&st);
-                bt_status_encode(&st, bt_status_wire);
-                vendor_send_response(bt_status_wire, sizeof(bt_status_wire));
-                return true;
-            }
-
-            case REQ_BT_GET_SCAN_RESULT: {
-                // wValue = index.  An out-of-range index returns an all-zero
-                // packet with count = total, so the host can detect the end.
-                static uint8_t bt_scan_wire[BT_SCAN_RESULT_SIZE];
-                BtScanResult r;
-                if (!bt_get_scan_result((uint8_t)setup->wValue, &r)) {
+            case REQ_BT: {
+                // IN direction of the BT opcode (the OUT ops are in the SET
+                // switch).  wValue low byte selects; anything else STALLs.
+                // Snapshots of RAM state only (no stack calls), encoded
+                // byte-wise per bt_proto.h.  Static: outlives the EP0 DATA stage.
+                uint8_t sel = (uint8_t)setup->wValue;
+                uint8_t idx = (uint8_t)(setup->wValue >> 8);
+                if (sel == BT_GET_STATUS && idx == 0) {
+                    static uint8_t bt_status_wire[BT_STATUS_PACKET_SIZE];
                     BtStatus st;
                     bt_get_status(&st);
-                    memset(&r, 0, sizeof(r));
-                    r.index = (uint8_t)setup->wValue;
-                    r.count = st.scan_count;
+                    bt_status_encode(&st, bt_status_wire);
+                    vendor_send_response(bt_status_wire, sizeof(bt_status_wire));
+                    return true;
                 }
-                bt_scan_result_encode(&r, bt_scan_wire);
-                vendor_send_response(bt_scan_wire, sizeof(bt_scan_wire));
-                return true;
+                if (sel == BT_GET_SCAN_RESULT) {
+                    // An out-of-range index returns an all-zero packet with
+                    // count = total, so the host can detect the end.
+                    static uint8_t bt_scan_wire[BT_SCAN_RESULT_SIZE];
+                    BtScanResult r;
+                    if (!bt_get_scan_result(idx, &r)) {
+                        BtStatus st;
+                        bt_get_status(&st);
+                        memset(&r, 0, sizeof(r));
+                        r.index = idx;
+                        r.count = st.scan_count;
+                    }
+                    bt_scan_result_encode(&r, bt_scan_wire);
+                    vendor_send_response(bt_scan_wire, sizeof(bt_scan_wire));
+                    return true;
+                }
+                return false;   // unknown selector -> STALL
             }
 #endif
 
@@ -4742,6 +4740,18 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             // that happen outside a dispatch bracket (e.g. timer callbacks).
             notify_set_source(PARAM_SRC_UNKNOWN);
             return ok;
+        }
+
+        // Bluetooth opcode (bt_proto.h): validate at SETUP, where wValue (op)
+        // and wLength are known, so an unknown op / short payload STALLs
+        // instead of being ACKed like other unknown SETs.  Builds without
+        // DSPI_BT STALL every 0x00 SET (hosts detect BT with the IN status).
+        if (req->bRequest == REQ_BT) {
+#if DSPI_BT
+            if (!bt_set_request_valid(req->wValue, req->wLength)) return false;
+#else
+            return false;
+#endif
         }
 
         // SET path — schedule DATA stage receive.
