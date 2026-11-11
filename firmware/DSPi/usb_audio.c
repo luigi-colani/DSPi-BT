@@ -30,6 +30,11 @@
 
 #include "tusb.h"
 #include "device/usbd_pvt.h"
+// Audio OUT is received in the USB IRQ through link-time wraps of the DCD
+// (see "Audio OUT receive in USB IRQ context"); these give the DCD event /
+// endpoint types and dcd_edpt_xfer().
+#include "device/dcd.h"
+#include "portable/raspberrypi/rp2040/rp2040_usb.h"
 #include "class/audio/audio.h"
 
 #include "usb_audio.h"
@@ -1161,8 +1166,12 @@ static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
 
 static void uac1_close_stream_eps(uint8_t rhport) {
     if (uac1.ep_data_open) {
-        usbd_edpt_close(rhport, AUDIO_OUT_ENDPOINT);
+        // Clear the flag BEFORE closing: the USB IRQ re-arms the data OUT EP
+        // whenever ep_data_open is set (see "Audio OUT receive in USB IRQ
+        // context"), so it must already read false once the close starts.
         uac1.ep_data_open = false;
+        __dmb();
+        usbd_edpt_close(rhport, AUDIO_OUT_ENDPOINT);
     }
     if (uac1.ep_fb_open) {
         usbd_edpt_close(rhport, AUDIO_IN_ENDPOINT);
@@ -1494,38 +1503,107 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
 }
 
 // ----------------------------------------------------------------------------
-// Endpoint transfer completion — audio RX producer + feedback re-arm.
-// Runs in USB IRQ context (rp2040/rp2350 DCD fires xfer_cb synchronously).
+// Audio OUT packet intake — gap detection + ring push (the ring producer).
+// Called from the USB IRQ (see below); RAM-resident like the rest of the
+// USB IRQ path.
+// ----------------------------------------------------------------------------
+
+static void __not_in_flash_func(uac1_audio_out_rx)(uint32_t xferred_bytes) {
+    usb_audio_packets++;
+
+    // Gap detection at actual packet arrival time (preserves the same
+    // fault-counting semantics as the old _as_audio_packet callback).
+    uint32_t now = time_us_32();
+    if (audio_ring_last_push_us > 0 && !preset_loading) {
+        uint32_t gap = now - audio_ring_last_push_us;
+        if (gap > 2000 && gap < 50000) {
+            spdif_underruns++;
+        }
+        if (gap > usb_audio_worst_packet_gap_us) usb_audio_worst_packet_gap_us = gap;
+    }
+    audio_ring_last_push_us = now;
+
+    // Only queue host audio when USB is the active DSP input source.
+    // In SPDIF mode the ring would never be drained, every push past
+    // the ring fill would bump overrun_count for no reason, and (more
+    // importantly) the data would be discarded anyway.
+    if (active_input_source == INPUT_SOURCE_USB) {
+        usb_audio_ring_push(&audio_ring, ep_out_buf,
+                            xferred_bytes > 0xFFFFu ? 0xFFFFu : (uint16_t)xferred_bytes);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Audio OUT receive in USB IRQ context.
+//
+// TinyUSB's DCD only *queues* DCD_EVENT_XFER_COMPLETE; usbd dispatches it to
+// the class driver's xfer_cb from tud_task() in the main loop.  An iso OUT
+// endpoint that is not re-armed before the host's next frame silently drops
+// that frame's packet, so with task-context re-arm any main-loop stall over
+// ~1 ms loses audio.  (Measured on a Pico 2 W with Bluetooth: the CYW43 /
+// BTstack low-priority IRQ preempts the main loop for 1-3 ms ~190x/s and
+// 5-8% of packets were lost; the stock build's main loop stays under
+// ~120 us.)
+//
+// So the data OUT endpoint is serviced entirely in the USB IRQ via two
+// link-time wraps (CMakeLists.txt, --wrap):
+//   * dcd_event_handler: consume the OUT EP's completion here (gap check +
+//     ring push) instead of queueing it, and flag the re-arm.
+//   * hw_endpoint_reset_transfer: the DCD calls it right after delivering
+//     the completion (dcd_rp2040.c hw_handle_buff_status); re-arming any
+//     earlier would be wiped by that reset and the next packet would hit
+//     "Can't continue xfer on inactive ep".  Re-arm after the real reset.
+// The usbd-level `busy` flag stays set while the stream runs, because the
+// completions never reach usbd; usbd_edpt_iso_activate() and the stall/
+// clear-stall in uac1_open_stream_eps() reset it on every activation.
+// When ep_data_open is false (alt 0 / closing) completions fall through to
+// usbd unchanged and xfer_cb does not re-arm.  Both wrappers run only from
+// the USB IRQ, which the flash blackout masks.
+// ----------------------------------------------------------------------------
+
+static volatile bool s_out_rearm_pending = false;
+
+void __real_dcd_event_handler(dcd_event_t const *event, bool in_isr);
+void __not_in_flash_func(__wrap_dcd_event_handler)(dcd_event_t const *event, bool in_isr) {
+    if (in_isr && event->event_id == DCD_EVENT_XFER_COMPLETE &&
+        event->xfer_complete.ep_addr == AUDIO_OUT_ENDPOINT && uac1.ep_data_open) {
+        if (event->xfer_complete.result == XFER_RESULT_SUCCESS && event->xfer_complete.len > 0) {
+            uac1_audio_out_rx(event->xfer_complete.len);
+        }
+        // Re-arm regardless of this frame's success — iso transfers fail-open.
+        s_out_rearm_pending = true;
+        return;
+    }
+    __real_dcd_event_handler(event, in_isr);
+}
+
+void __real_hw_endpoint_reset_transfer(struct hw_endpoint *ep);
+void __not_in_flash_func(__wrap_hw_endpoint_reset_transfer)(struct hw_endpoint *ep) {
+    __real_hw_endpoint_reset_transfer(ep);
+    if (s_out_rearm_pending && ep->ep_addr == AUDIO_OUT_ENDPOINT) {
+        s_out_rearm_pending = false;
+        if (uac1.ep_data_open) {
+            dcd_edpt_xfer(0, AUDIO_OUT_ENDPOINT, ep_out_buf, AUDIO_EP_MAX_PKT);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Endpoint transfer completion — feedback / notify re-arm (tud_task context).
+// The data OUT EP is normally consumed in the USB IRQ above and only reaches
+// here when it is not open (then it must not be re-armed).
 // ----------------------------------------------------------------------------
 
 static bool __not_in_flash_func(uac1_driver_xfer_cb)(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
     if (ep_addr == AUDIO_OUT_ENDPOINT) {
-        if (result == XFER_RESULT_SUCCESS && xferred_bytes > 0) {
-            usb_audio_packets++;
-
-            // Gap detection at actual packet arrival time (preserves the same
-            // fault-counting semantics as the old _as_audio_packet callback).
-            uint32_t now = time_us_32();
-            if (audio_ring_last_push_us > 0 && !preset_loading) {
-                uint32_t gap = now - audio_ring_last_push_us;
-                if (gap > 2000 && gap < 50000) {
-                    spdif_underruns++;
-                }
-                if (gap > usb_audio_worst_packet_gap_us) usb_audio_worst_packet_gap_us = gap;
+        if (uac1.ep_data_open) {
+            // Not expected (the IRQ path owns open-stream completions); keep
+            // the stream alive the old way if it ever happens.
+            if (result == XFER_RESULT_SUCCESS && xferred_bytes > 0) {
+                uac1_audio_out_rx(xferred_bytes);
             }
-            audio_ring_last_push_us = now;
-
-            // Only queue host audio when USB is the active DSP input source.
-            // In SPDIF mode the ring would never be drained, every push past
-            // the 4-slot ring fill would bump overrun_count for no reason,
-            // and (more importantly) the data would be discarded anyway.
-            if (active_input_source == INPUT_SOURCE_USB) {
-                usb_audio_ring_push(&audio_ring, ep_out_buf,
-                                    xferred_bytes > 0xFFFFu ? 0xFFFFu : (uint16_t)xferred_bytes);
-            }
+            uac1_arm_data_out(rhport);
         }
-        // Re-arm regardless of this frame's success — iso transfers fail-open.
-        if (uac1.ep_data_open) uac1_arm_data_out(rhport);
         return true;
     }
 

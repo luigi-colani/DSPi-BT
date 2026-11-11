@@ -65,6 +65,23 @@ void adat_output_resync(void);
 // The next adat_output_resync() claims the configured pin.
 void adat_output_release_moving_pin(void);
 
+#if DSPI_BT
+#include <stddef.h>
+// Lend the ADAT output ring to the Bluetooth FIFO while BT holds the radio
+// (ADAT is stood down for that span).  Stops ADAT hardware immediately and
+// keeps it stopped (resync will not arm) until reclaimed.  Returns the ring
+// (4-byte aligned) or NULL if `bytes` does not fit.  Core 0, main loop only.
+void *adat_output_lend_ring(size_t bytes);
+// Return the ring: refill it with ADAT silence and allow resync to re-arm.
+// Call BEFORE the restore path's complete_pipeline_reset().  Idempotent.
+void  adat_output_reclaim_ring(void);
+#endif
+
+// Mirrors the DMA-starvation monitoring state (usb_audio.c SOF/alt handling):
+// while true, silence insertion is slaved 1:1 to slot 0's starvation counter;
+// while false (host stream stopped) the cushion free-runs on silence.
+void adat_output_set_stream_active(bool active);
+
 // Mirror a skip applied identically to every slot ring (output ring
 // admission), before the block that follows it is pushed.  RAM-resident.
 void adat_output_on_slot_skip(uint32_t frames);

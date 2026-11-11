@@ -43,6 +43,9 @@
 #include "audio_pipeline.h"
 #include "audio_clock_div.h"
 #include "notify.h"
+#if DSPI_BT
+#include "bt_fifo.h"   // sizeof(bt_fifo_t) for the ring-lend fit check
+#endif
 
 #define ADAT_PIO                pio1   // PDM owns SM 0 on this block
 #define ADAT_SM                 1
@@ -87,6 +90,12 @@ static uint32_t adat_wr_frame;
 // from an ISR or Core 1.
 static bool     adat_running;
 static bool     adat_hw_init_done;
+#if DSPI_BT
+// True while adat_ring is lent to the Bluetooth FIFO (adat_output_lend_ring).
+// While set, ADAT is held stopped: resync refuses to arm the DMA/SM, and every
+// other ring writer is already gated on adat_running (false).
+static bool     adat_ring_lent;
+#endif
 static uint8_t  adat_hw_pin = 0xFF;       // GPIO currently routed to the PIO
 static uint     adat_pio_offset;
 static uint32_t adat_cur_freq = 48000;
@@ -366,6 +375,42 @@ void adat_output_release_moving_pin(void) {
     adat_release_pin();
 }
 
+#if DSPI_BT
+// The Bluetooth FIFO (bt_fifo_t, ~16 KiB) is placed in the ADAT output ring
+// instead of its own static RAM: the radio stands ADAT down for exactly the
+// span Bluetooth is enabled, and the extra ~16-32 KiB of .bss otherwise starved
+// the boot-time heap (audio producer pools) into a malloc panic.
+_Static_assert(sizeof(bt_fifo_t) <= sizeof(adat_ring),
+               "BT FIFO must fit in the ADAT output ring it borrows");
+_Static_assert(_Alignof(bt_fifo_t) <= _Alignof(uint32_t),
+               "BT FIFO alignment exceeds the ADAT ring's");
+
+void *adat_output_lend_ring(size_t bytes) {
+    if (bytes > sizeof(adat_ring)) return NULL;
+    // Physically stop ADAT here rather than trusting the (deferred) config
+    // teardown: DMA aborted + SM disabled before anyone else writes the ring.
+    // Idempotent; a no-op when ADAT was never brought up.
+    adat_stop_hw();
+    adat_need_local_resync = false;
+    adat_ring_lent = true;
+    adat_notify_if_changed();
+    return adat_ring;
+}
+
+void adat_output_reclaim_ring(void) {
+    if (!adat_ring_lent) return;
+    // The ring holds BT samples, not ADAT line code.  Refill ALL of it with
+    // valid NRZI silence so the DMA can never play the borrower's bytes, even
+    // past the resync cushion.  ADAT stays stopped; the caller's restore path
+    // (stand-down release -> complete_pipeline_reset -> resync) re-arms it.
+    adat_line_level = 0;
+    adat_wr_frame = 0;
+    adat_write_silence(ADAT_RING_FRAMES);
+    adat_wr_frame = 0;
+    adat_ring_lent = false;
+}
+#endif
+
 void adat_output_resync(void) {
     adat_stop_hw();
     adat_output_config_dirty = false;
@@ -376,7 +421,11 @@ void adat_output_resync(void) {
     adat_cur_freq = audio_state.freq;
     adat_rate_ok = (adat_cur_freq <= 48000);
 
-    if (!adat_cfg_enabled || !adat_rate_ok) {
+    bool ring_lent = false;
+#if DSPI_BT
+    ring_lent = adat_ring_lent;   // ring holds the BT FIFO: never arm over it
+#endif
+    if (!adat_cfg_enabled || !adat_rate_ok || ring_lent) {
         adat_release_pin();
         adat_notify_if_changed();
         return;

@@ -442,15 +442,19 @@ The model's host honours feedback exactly, on average. It therefore cannot repro
 ### USB Audio Decoupling (SPSC Ring Buffer)
 *Last updated: 2026-04-18*
 
-The DSP pipeline is decoupled from USB audio transfer completion via a lock-free SPSC ring buffer (`usb_audio_ring.h`). The UAC1 class driver's `xfer_cb` pushes raw packets into the ring; the main loop drains the ring and runs the full DSP pipeline. This prevents the USB stack from being blocked for hundreds of microseconds per packet and eliminates ISR-context spinlock contention.
+The DSP pipeline is decoupled from USB audio transfer completion via a lock-free SPSC ring buffer (`usb_audio_ring.h`). The USB IRQ pushes raw packets into the ring; the main loop drains the ring and runs the full DSP pipeline. This prevents the USB stack from being blocked for hundreds of microseconds per packet and eliminates ISR-context spinlock contention.
 
-**Context change vs. pico-extras:** under pico-extras, `_as_audio_packet` ran in USB IRQ context. Under TinyUSB, `DCD_EVENT_XFER_COMPLETE` is enqueued in the USB IRQ and dispatched to `uac1_driver_xfer_cb` from `tud_task()` (main-loop context). SOF still runs in IRQ. The ring itself is unchanged — the producer moved from IRQ to task, the consumer remained in the main loop.
+**Audio OUT is received in USB IRQ context (2026-11-11):** stock TinyUSB enqueues `DCD_EVENT_XFER_COMPLETE` and dispatches `xfer_cb` from `tud_task()` in the main loop. An iso OUT endpoint that is not re-armed before the host's next frame silently drops that frame's packet, so task-context re-arm loses audio whenever the main loop stalls for more than ~1 ms. That was measured on a Pico 2 W with Bluetooth: the CYW43/BTstack low-priority IRQ pre-empted the main loop for 1–3 ms about 190 times a second, and 5–8 % of packets were lost. The data OUT endpoint (EP 0x01) is therefore serviced entirely in the USB IRQ through two link-time wraps (`--wrap`, set in `firmware/DSPi/CMakeLists.txt`):
+- `dcd_event_handler`: the wrapper consumes the EP 0x01 completion, doing gap detection and ring push in `uac1_audio_out_rx()`, instead of queueing it.
+- `hw_endpoint_reset_transfer`: the DCD calls this right after delivering a completion, so the wrapper re-arms *after* the real reset. Re-arming any earlier would be wiped and would panic the next packet.
 
-**Ring buffer:** 4 fixed-size slots × 578 bytes (576 payload + 2 length). ~2.3KB BSS. Placed in RAM (`__not_in_flash`) for flash-operation safety. Peek/consume pattern (zero-copy consumer).
+The usbd `busy` flag stays set while the stream runs; `usbd_edpt_iso_activate()` and the stall/clear-stall in `uac1_open_stream_eps()` reset it on every activation. `uac1.ep_data_open` is cleared *before* the endpoint is closed, and while it is false, completions fall through to usbd unchanged. The feedback (EP 0x82) and notify endpoints are still re-armed from `tud_task()`. SOF runs in the IRQ as before. Everything reached from the wrappers is RAM-resident; the USB IRQ is masked by the flash blackout.
+
+**Ring buffer:** 4 fixed-size slots (8 in `DSPI_BT` builds, to absorb the up-to-~3 ms main-loop stalls of the radio stack), each `USB_RING_MAX_PKT` (582 B on RP2040, 788 B on RP2350) plus a length field. Placed in RAM (`__not_in_flash`) for flash-operation safety. Peek/consume pattern (zero-copy consumer).
 
 **Memory barriers:** `__dmb()` at publish/acquire points. Redundant on RP2040 (Cortex-M0+ in-order single-bus) but required on RP2350 (Cortex-M33 write buffer).
 
-**Gap detection:** USB packet arrival gap measurement runs in `uac1_driver_xfer_cb` (task context under TinyUSB) using file-scope `audio_ring_last_push_us`, reset on stream lifecycle transitions in `uac1_apply_alt()` and `usb_audio_flush_ring()`.
+**Gap detection:** USB packet arrival gap measurement runs in `uac1_audio_out_rx()` (USB IRQ context) using file-scope `audio_ring_last_push_us`, reset on stream lifecycle transitions in `uac1_apply_alt()` and `usb_audio_flush_ring()`.
 
 **Ring overruns:** `audio_ring.overrun_count`, queryable via `REQ_GET_STATUS` wValue=22. wValue=7 (`spdif_overruns`, producer-pool take failures) is retired and always reads 0. *Last updated: 2026-10-12*
 
@@ -459,9 +463,9 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 ### Packet Flow
 *Last updated: 2026-04-18*
 
-`uac1_driver_xfer_cb(EP 0x01)` → `usb_audio_ring_push()` → (main loop) → `usb_audio_drain_ring()` → `process_audio_packet(data, len)` [usb_audio.c] → `process_input_block(sample_count)` [audio_pipeline.c]
+`__wrap_dcd_event_handler` → `uac1_audio_out_rx()` (USB IRQ, EP 0x01) → `usb_audio_ring_push()` → (main loop) → `usb_audio_drain_ring()` → `process_audio_packet(data, len)` [usb_audio.c] → `process_input_block(sample_count)` [audio_pipeline.c]
 
-1. **Ring push (task context)** — Copy raw packet into SPSC ring, detect arrival gaps
+1. **Ring push (USB IRQ context)** — Copy raw packet into SPSC ring, detect arrival gaps
 2. **Ring drain (main loop)** — Peek/process/consume loop, highest priority in main loop
 3. **USB decode (`process_audio_packet` in `usb_audio.c`)** — Gap detection, sync tracking, USB byte decode (16/24-bit) with per-channel preamp into `buf_l[]`/`buf_r[]`
 4. **DSP pipeline (`process_input_block` in `audio_pipeline.c`)**; input-agnostic: buffer acquisition, preset mute envelope, EQ, leveller, matrix mixer, per-output-pair crossfeed (PASS 4.5), per-output EQ/gain/loudness/limiter/delay, output encoding, buffer return, CPU metering

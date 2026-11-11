@@ -27,8 +27,17 @@
 
 // Ring geometry.  4 slots = 4ms of jitter absorption at 1 packet/ms.
 // The ring should be nearly empty in steady state; its purpose is
-// decoupling, not deep buffering.
+// decoupling, not deep buffering.  The producer is the USB IRQ (see
+// usb_audio.c "Audio OUT receive in USB IRQ context"), so the ring must
+// cover the longest main-loop stall: on a Pico 2 W with Bluetooth the
+// CYW43/BTstack low-priority IRQ preempts the main loop for up to ~3 ms,
+// which would fill the 3 usable slots of a 4-slot ring.  BT builds get 8.
+// Must be a power of two (index masking).
+#if DSPI_BT
+#define USB_RING_SLOTS      8
+#else
 #define USB_RING_SLOTS      4
+#endif
 #define USB_RING_SLOT_MASK  (USB_RING_SLOTS - 1)
 
 // Maximum payload per slot.  Must accommodate the largest possible USB audio

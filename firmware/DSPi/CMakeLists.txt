@@ -160,6 +160,14 @@ if (DSPI_BT)
     # CYW43_LWIP=0: Bluetooth only, no Wi-Fi/IP stack (no lwIP linked).
     target_compile_definitions(DSPi PRIVATE DSPI_BT=1 CYW43_LWIP=0)
 
+    # CYW43 gSPI clock.  The radio is driven by a PIO SPI program clocked at
+    # clk_sys / CYW43_PIO_CLOCK_DIV_INT, two PIO cycles per SPI bit.  The SDK
+    # default divider (2) assumes the stock ~150 MHz clk_sys (-> 37.5 MHz SPI);
+    # DSPi runs clk_sys at 307.2 MHz, which would put the bus at 76.8 MHz — past
+    # the CYW43439's 50 MHz gSPI limit, so the chip never comes up ("Failed to
+    # start CYW43").  Divide by 4: 307.2 / 4 / 2 = 38.4 MHz, matching stock.
+    target_compile_definitions(DSPi PRIVATE CYW43_PIO_CLOCK_DIV_INT=4)
+
     # BTstack link-key TLV flash bank placement.  The pico-sdk default bank sits
     # in the LAST sectors of flash, which is exactly where DSPi's preset region
     # lives (flash_storage.c: the last 1 + 10*2 = 21 sectors on RP2350) — so the
@@ -285,6 +293,15 @@ target_link_libraries(DSPi
     pico_audio_i2s_multi
     pico_spdif_rx
     tinyusb_device
+)
+
+# USB audio OUT is received and re-armed in the USB IRQ, not in tud_task():
+# usb_audio.c wraps these two TinyUSB DCD-path symbols (see "Audio OUT receive
+# in USB IRQ context" there).  Only the DCD's cross-object references are
+# redirected; TinyUSB's own internal calls are unaffected.
+target_link_options(DSPi PRIVATE
+    "LINKER:--wrap=dcd_event_handler"
+    "LINKER:--wrap=hw_endpoint_reset_transfer"
 )
 
 # Debug UART removed; GPIO 16/17 are freed for the UART control interface.

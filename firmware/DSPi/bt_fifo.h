@@ -5,8 +5,8 @@
  * Producer: the audio pipeline (audio_pipeline.c, process_input_block) on
  *   Core 0, via bt_fifo_push() — the processed main pair (outputs 0-1).
  * Consumer: the BTstack A2DP media timer (bt_output.c) on Core 0, via
- *   bt_fifo_pop() — pops stereo frames and converts float -> interleaved int16
- *   for the SBC encoder.
+ *   bt_fifo_pop() — pops stereo frames as interleaved int16 for the SBC
+ *   encoder (the float -> int16 conversion happens on push).
  *
  * Single-producer / single-consumer, lock-free.  Mirrors the discipline of
  * usb_audio_ring.h: fixed power-of-two slot count, volatile head/tail written
@@ -50,19 +50,25 @@
 // ---------------------------------------------------------------------------
 // Power of two so head/tail wrap with a mask.  4096 stereo frames is ~85 ms of
 // decoupling headroom at 48 kHz / ~93 ms at 44.1 kHz — deep enough to absorb
-// the 10 ms A2DP media-timer bursts against the ~1 ms pipeline push cadence,
-// at 32 KiB of RAM (4096 * 2ch * 4B).
+// the 10 ms A2DP media-timer bursts against the ~1 ms pipeline push cadence.
+//
+// Slots hold the ALREADY-CONVERTED int16 samples (the SBC encoder's input
+// domain): the producer applies bt_fifo_f32_to_s16() on push instead of the
+// consumer on pop, so the popped stream is bit-identical to converting at pop
+// time, at half the RAM — 16 KiB (4096 * 2ch * 2B).  On the device the whole
+// bt_fifo_t lives in the ADAT output ring, which is borrowed while Bluetooth
+// holds the radio (ADAT is stood down then; see adat_output_lend_ring()).
 #define BT_FIFO_FRAMES   4096u
 #define BT_FIFO_MASK     (BT_FIFO_FRAMES - 1u)
 
 typedef struct {
-    float l;
-    float r;
+    int16_t l;
+    int16_t r;
 } bt_fifo_frame_t;
 
 typedef struct {
-    // 4-byte aligned per the usb_audio_ring discipline (word-aligned float
-    // pair access; keeps the compiler free to emit paired loads/stores).
+    // 4-byte aligned per the usb_audio_ring discipline (one word per stereo
+    // frame; keeps the compiler free to emit single-word loads/stores).
     bt_fifo_frame_t slots[BT_FIFO_FRAMES] __attribute__((aligned(4)));
     volatile uint32_t head;              // producer writes only
     volatile uint32_t tail;              // consumer writes only
@@ -152,7 +158,8 @@ static inline int16_t bt_fifo_f32_to_s16(float v) {
     return (int16_t)s;
 }
 
-// Producer: push up to n stereo frames from separate L/R float planes.
+// Producer: push up to n stereo frames from separate L/R float planes,
+// converting each sample to clamped int16 on the way in.
 // Returns the number of frames accepted; any shortfall is counted in
 // overflow_frames and those frames are dropped (never blocks).
 static inline uint32_t bt_fifo_push_n(bt_fifo_t *f,
@@ -165,8 +172,8 @@ static inline uint32_t bt_fifo_push_n(bt_fifo_t *f,
     uint32_t count = (n <= space) ? n : space;
 
     for (uint32_t i = 0; i < count; i++) {
-        f->slots[h].l = l[i];
-        f->slots[h].r = r[i];
+        f->slots[h].l = bt_fifo_f32_to_s16(l[i]);
+        f->slots[h].r = bt_fifo_f32_to_s16(r[i]);
         h = (h + 1) & BT_FIFO_MASK;
     }
     // Release barrier: slot writes visible before the head advance publishes
@@ -180,8 +187,8 @@ static inline uint32_t bt_fifo_push_n(bt_fifo_t *f,
     return count;
 }
 
-// Consumer: pop up to n stereo frames, converting each float sample to a
-// clamped interleaved int16 (L,R,L,R,...).  Returns the number of frames
+// Consumer: pop up to n stereo frames as interleaved int16 (L,R,L,R,...);
+// the samples were clamped/converted at push.  Returns the number of frames
 // popped; any shortfall is counted in underflow_frames (the caller fills the
 // remainder with silence).
 static inline uint32_t bt_fifo_pop_n(bt_fifo_t *f,
@@ -196,8 +203,8 @@ static inline uint32_t bt_fifo_pop_n(bt_fifo_t *f,
     // before head advanced is observed here.
     __dmb();
     for (uint32_t i = 0; i < count; i++) {
-        interleaved[i * 2]     = bt_fifo_f32_to_s16(f->slots[t].l);
-        interleaved[i * 2 + 1] = bt_fifo_f32_to_s16(f->slots[t].r);
+        interleaved[i * 2]     = f->slots[t].l;
+        interleaved[i * 2 + 1] = f->slots[t].r;
         t = (t + 1) & BT_FIFO_MASK;
     }
     // Release barrier: slot reads complete before tail frees them.

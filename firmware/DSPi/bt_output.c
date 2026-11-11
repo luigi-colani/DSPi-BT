@@ -28,11 +28,13 @@
 
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
+#include "pico/bootrom.h"     // rom_reset_usb_boot_extra (1200-baud BOOTSEL reset)
 #include "pico/cyw43_arch.h"
 #include "tusb.h"          // tud_mounted()
 #include "btstack.h"
 
 #include "bt_fifo.h"
+#include "adat_output.h"      // adat_output_lend_ring / _reclaim_ring (FIFO storage)
 #include "bt_metrics.h"
 #include "bt_persist.h"       // bt_persist_encode/decode (shared enable contract)
 #include "notify.h"
@@ -76,30 +78,56 @@ static volatile uint32_t s_sbc_encode_us_max  = 0;
 // bt_fifo.h).  Producer: audio_pipeline.c.  Consumer: the media timer below.
 // ---------------------------------------------------------------------------
 
-static bt_fifo_t s_fifo;
+// The FIFO has no static storage of its own: it lives in the ADAT output ring,
+// borrowed (adat_output_lend_ring) from the radio stand-down until the outputs
+// are restored.  NULL outside that span — every accessor below is NULL-safe,
+// and the producer is additionally gated on s_bt_enabled, which is only set
+// while a stream runs (i.e. while the ring is held).
+static bt_fifo_t * volatile s_fifo = NULL;
+
+static void bt_fifo_acquire(void) {
+    if (s_fifo) return;
+    bt_fifo_t *f = (bt_fifo_t *)adat_output_lend_ring(sizeof(bt_fifo_t));
+    if (f) bt_fifo_init(f);
+    __dmb();
+    s_fifo = f;
+}
+
+// Caller has stopped the producer (s_bt_enabled = false) and the consumer
+// (media timer) first.  Must precede the restore path's complete reset.
+static void bt_fifo_release(void) {
+    if (!s_fifo) return;
+    s_fifo = NULL;
+    __dmb();
+    adat_output_reclaim_ring();
+}
 
 // Producer entry — called from the Core-0 audio path; kept in RAM so it is
 // safe to run while XIP flash is busy (mirrors usb_audio_ring discipline).
 void __not_in_flash_func(bt_fifo_push)(const float *l, const float *r, uint32_t n) {
-    bt_fifo_push_n(&s_fifo, l, r, n);
+    bt_fifo_t *f = s_fifo;
+    if (f) bt_fifo_push_n(f, l, r, n);
 }
 
 uint32_t bt_fifo_pop(int16_t *interleaved, uint32_t n_frames) {
-    return bt_fifo_pop_drift(&s_fifo, interleaved, n_frames);
+    bt_fifo_t *f = s_fifo;
+    return f ? bt_fifo_pop_drift(f, interleaved, n_frames) : 0;
 }
 
 void bt_fifo_reset(void) {
-    bt_fifo_reset_ring(&s_fifo);
+    bt_fifo_t *f = s_fifo;
+    if (f) bt_fifo_reset_ring(f);
 }
 
 BtMetrics bt_output_metrics(void) {
     BtMetrics m;
+    bt_fifo_t *f = s_fifo;
     m.audio_callback_overruns = spdif_overruns;
-    m.fifo_overflow_frames    = s_fifo.overflow_frames;
-    m.fifo_underflow_frames   = s_fifo.underflow_frames;
-    m.fifo_fill_frames        = s_fifo.drift_fill;
-    m.fifo_drift_skip_frames  = s_fifo.drift_skipped_frames;
-    m.fifo_drift_dup_frames   = s_fifo.drift_duplicated_frames;
+    m.fifo_overflow_frames    = f ? f->overflow_frames : 0;
+    m.fifo_underflow_frames   = f ? f->underflow_frames : 0;
+    m.fifo_fill_frames        = f ? f->drift_fill : 0;
+    m.fifo_drift_skip_frames  = f ? f->drift_skipped_frames : 0;
+    m.fifo_drift_dup_frames   = f ? f->drift_duplicated_frames : 0;
     m.sbc_encode_us_last      = s_sbc_encode_us_last;
     m.sbc_encode_us_max       = s_sbc_encode_us_max;
     return m;
@@ -807,7 +835,7 @@ static void stats_timeout_handler(btstack_timer_source_t * ts){
            " fill=%" PRIu32 " skip=%" PRIu32 " dup=%" PRIu32 "\n",
            (int)s_bt_enabled, m.audio_callback_overruns, m.fifo_overflow_frames,
            m.fifo_underflow_frames, m.sbc_encode_us_last, m.sbc_encode_us_max,
-           bt_fifo_available(&s_fifo), m.fifo_fill_frames,
+           s_fifo ? bt_fifo_available(s_fifo) : 0u, m.fifo_fill_frames,
            m.fifo_drift_skip_frames, m.fifo_drift_dup_frames);
     btstack_run_loop_set_timer(ts, 1000);
     btstack_run_loop_add_timer(ts);
@@ -817,8 +845,9 @@ static void stats_timeout_handler(btstack_timer_source_t * ts){
 // Public API
 // ---------------------------------------------------------------------------
 void bt_output_init(void){
-    // Fast, non-blocking only — this runs before the main loop.
-    bt_fifo_init(&s_fifo);
+    // Fast, non-blocking only — this runs before the main loop.  (No FIFO init
+    // here: the FIFO's storage is the ADAT ring, borrowed only after the radio
+    // stand-down — see bt_fifo_acquire().)
 
     // Seed the enable state from the persisted device-global directory (Task 6).
     // Runs after preset_boot_load() (main.c ordering), so the directory cache is
@@ -846,6 +875,7 @@ void bt_output_init(void){
 static void bt_restore_outputs(void){
     uint8_t restored = 0;
     bt_pipeline_reset_prepare();
+    bt_fifo_release();          // ring back to ADAT before resync can re-arm it
     bt_radio_standdown(false, &restored);
     bt_pipeline_reset_complete();
     printf("[bt] outputs restored mask=0x%02x\n", restored);
@@ -901,6 +931,7 @@ static void bt_service_commands(void){
                 bt_pipeline_reset_prepare();
                 bt_radio_standdown(true, &mask);
                 bt_pipeline_reset_complete();
+                bt_fifo_acquire();             // borrow the (stopped) ADAT ring
                 s_user_enabled = true;
                 bt_mark_persist(true);                 // persist BT on (deferred)
                 s_last_status = BT_ERR_NONE;
@@ -932,7 +963,19 @@ static void bt_service_commands(void){
         s_forget_pending = false;
         s_user_directed = true;
         if (bt_link_busy() && memcmp(s_target_addr, s_forget_addr, 6) == 0) bt_do_disconnect();
-        cyw43_arch_lwip_begin(); gap_drop_link_key_for_bd_addr(s_forget_addr); cyw43_arch_lwip_end();
+        cyw43_arch_lwip_begin();
+        gap_drop_link_key_for_bd_addr(s_forget_addr);
+        // Also drop the baseband (ACL) link to that device.  Releasing A2DP
+        // alone leaves the ACL up for a while, still authenticated and
+        // encrypted with the key just deleted; an immediate reconnect would
+        // reuse it, skip pairing, and so never store a new bond — the next
+        // boot then has nothing to reconnect to.  Closing the ACL forces the
+        // next connect to pair afresh.
+        {
+            hci_connection_t *acl = hci_connection_for_bd_addr_and_type(s_forget_addr, BD_ADDR_TYPE_ACL);
+            if (acl) gap_disconnect(acl->con_handle);
+        }
+        cyw43_arch_lwip_end();
         for (uint8_t i = 0; i < s_scan_count; i++)
             if (memcmp(s_scan[i].addr, s_forget_addr, 6) == 0) s_scan[i].flags &= (uint8_t)~BT_SCAN_FLAG_BONDED;
         printf("[bt] forgot %s\n", bd_addr_to_str(s_forget_addr));
@@ -1073,7 +1116,9 @@ void bt_output_poll(void){
     bt_pipeline_reset_prepare();
     bt_radio_standdown(true, &stood_down);
     bt_pipeline_reset_complete();
-    printf("[bt] output stand-down mask=0x%02x (bit0=PDM bit1=ADAT)\n", stood_down);
+    bt_fifo_acquire();               // borrow the (now stopped) ADAT ring
+    printf("[bt] output stand-down mask=0x%02x (bit0=PDM bit1=ADAT) fifo=%s\n",
+           stood_down, s_fifo ? "ok" : "NONE");
 
     printf("[bt] cyw43_arch_init...\n");
     if (cyw43_arch_init()){
@@ -1083,6 +1128,7 @@ void bt_output_poll(void){
         // stand-down (bracketed, so the restart is click-free too).
         uint8_t restored = 0;
         bt_pipeline_reset_prepare();
+        bt_fifo_release();
         bt_radio_standdown(false, &restored);
         bt_pipeline_reset_complete();
         return;
@@ -1118,6 +1164,19 @@ void bt_output_poll(void){
 // Hot path: the audio pipeline reads this every block to decide whether to push
 // the mains, so it must be RAM-resident (no flash fetch while XIP is disabled
 // during a flash write).  Mirrors the bt_fifo_push placement.
+// Standard Pico "1200-baud touch": a host that sets the CDC line coding to
+// 1200 baud reboots the device into the BOOTSEL mass-storage loader, so new
+// firmware can be flashed without the button.  pico_stdio_usb normally provides
+// this (reset_interface.c), but it is compiled out when the app owns the
+// TinyUSB device (LIB_TINYUSB_DEVICE), as DSPi does — so mirror it here.
+// Runs from tud_task (Core 0 main loop), exactly as the SDK's version does.
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *p_line_coding){
+    (void)itf;
+    if (p_line_coding->bit_rate == 1200u){
+        rom_reset_usb_boot_extra(-1, 0, false);
+    }
+}
+
 bool __not_in_flash_func(bt_output_is_enabled)(void){
     return s_bt_enabled;
 }
