@@ -1465,6 +1465,7 @@ static void complete_pipeline_reset(void) {
 bool bt_pipeline_reset_ready(void)    { return pipeline_reset_ready(); }
 void bt_pipeline_reset_prepare(void)  { prepare_pipeline_reset(PRESET_MUTE_SAMPLES); }
 void bt_pipeline_reset_complete(void) { complete_pipeline_reset(); }
+uint32_t bt_pipeline_rate(void)       { return audio_state.freq; }
 #endif
 
 // Disable all outputs, stop their DMA and reset their rings. Outputs stay

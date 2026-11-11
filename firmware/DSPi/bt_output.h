@@ -78,27 +78,37 @@ bool bt_radio_standdown(bool on, uint8_t *stood_down_mask);
 bool bt_pipeline_reset_ready(void);
 void bt_pipeline_reset_prepare(void);
 void bt_pipeline_reset_complete(void);
+// Current pipeline sample rate (audio_state.freq), for the BT rate follow.
+// Implemented in main.c so bt_output.c need not pull in config.h.
+uint32_t bt_pipeline_rate(void);
 
 // Sink's negotiated SBC sampling rate in Hz (44100 / 48000), or the preferred
 // default before a codec is configured.  Plain RAM read, any context.
 uint32_t bt_output_sink_rate(void);
+// Sink's SBC sampling-frequency capabilities (BT_RATE_CAP_* bits from
+// bt_rate.h; 0 = unknown).  The link can be reconfigured to any rate set here.
+uint8_t bt_output_sink_rate_caps(void);
 
 #endif // DSPI_BT
 
 // ---- Rate policy (Task 7) --------------------------------------------------
-// While BT streams, the pipeline follows the sink's SBC rate and 96 kHz is
-// refused.  Both helpers are identity / always-true on non-BT builds, so wired
-// rate behaviour is unchanged there.
+// While BT streams, the Bluetooth link follows the pipeline rate when the sink
+// supports it; otherwise (96 kHz, single-rate sink) the pipeline is pinned to
+// the sink's SBC rate and USB refuses the rate.  See bt_rate.h.  Both helpers
+// are identity / always-true on non-BT builds, so wired rate behaviour is
+// unchanged there.
 static inline uint32_t bt_output_apply_rate_policy(uint32_t requested) {
 #if DSPI_BT
-    return bt_rate_clamp(requested, bt_output_is_enabled(), bt_output_sink_rate());
+    return bt_rate_clamp(requested, bt_output_is_enabled(), bt_output_sink_rate(),
+                         bt_output_sink_rate_caps());
 #else
     return requested;
 #endif
 }
 static inline bool bt_output_rate_allowed(uint32_t requested) {
 #if DSPI_BT
-    return bt_rate_allowed(requested, bt_output_is_enabled(), bt_output_sink_rate());
+    return bt_rate_allowed(requested, bt_output_is_enabled(), bt_output_sink_rate(),
+                           bt_output_sink_rate_caps());
 #else
     (void)requested;
     return true;

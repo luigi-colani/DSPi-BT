@@ -60,7 +60,7 @@ bool preset_get_bt_enabled(void);
 
 // Preferred sampling rate offered to the sink; the sink selects the final
 // value in its SBC configuration (the WH-1000XM4 offers 44.1 kHz).
-#define A2DP_SOURCE_PREFERRED_SAMPLING_RATE 44100
+#define A2DP_SOURCE_PREFERRED_SAMPLING_RATE 48000   // default; each connect prefers the pipeline rate
 
 // ---------------------------------------------------------------------------
 // Metrics (see bt_metrics.h)
@@ -197,6 +197,19 @@ static a2dp_media_sending_context_t media_tracker;
 
 static int current_sample_rate = A2DP_SOURCE_PREFERRED_SAMPLING_RATE;
 
+// Sink SBC rate capabilities (BT_RATE_CAP_* from bt_rate.h), collected from the
+// codec-capability discovery of the current connection; 0 = unknown.  A rate
+// the sink rejects on reconfigure is removed again.
+static volatile uint8_t s_sink_rate_caps = 0;
+static avdtp_stream_endpoint_t *s_local_sep = NULL;
+
+// Rate follow (bt_service_rate_follow): the pipeline rate changed under a
+// streaming link -> pause, reconfigure the SBC sampling rate, restart.  AVDTP
+// only reconfigures a stream that is open but not streaming.
+enum { BT_RS_IDLE = 0, BT_RS_PAUSING, BT_RS_RECONFIG };
+static volatile uint8_t s_rs_state  = BT_RS_IDLE;
+static uint32_t         s_rs_target = 0;
+
 // Minimal AVRCP now-playing entry (the sink may query it; volume keys work
 // without rich metadata).
 static avrcp_track_t tracks[] = {
@@ -325,6 +338,7 @@ static int a2dp_source_and_avrcp_services_init(void){
         return 1;
     }
     avdtp_set_preferred_sampling_frequency(local_stream_endpoint, A2DP_SOURCE_PREFERRED_SAMPLING_RATE);
+    s_local_sep = local_stream_endpoint;
     media_tracker.local_seid = avdtp_local_seid(local_stream_endpoint);
     avdtp_source_register_delay_reporting_category(media_tracker.local_seid);
 
@@ -564,6 +578,52 @@ static void bt_scan_next_name(void){
 // ---------------------------------------------------------------------------
 // HCI events — auto-connect to the fixed sink once the controller is working.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Sample-rate follow.  The SBC link runs at the pipeline's rate whenever the
+// sink supports it (bt_rate.h policy), so host / input content is never
+// pitch-shifted and USB need not refuse 44.1 vs 48 kHz.
+// ---------------------------------------------------------------------------
+static uint8_t bt_rate_cap_bit(uint32_t rate){
+    return rate == 48000u ? BT_RATE_CAP_48000 : rate == 44100u ? BT_RATE_CAP_44100 : 0u;
+}
+
+// Offer the pipeline's rate as the preferred SBC rate for the next stream
+// negotiation (BTstack picks it when the sink supports it).  BTstack context.
+static void bt_prefer_pipeline_rate(void){
+    if (s_local_sep)
+        avdtp_set_preferred_sampling_frequency(s_local_sep, bt_rate_preferred(bt_pipeline_rate()));
+}
+
+// A reconfigure step failed: treat the target rate as unsupported (the policy
+// then pins the pipeline to the link rate, as on a single-rate sink — no
+// retry loop) and resume streaming at the current rate.  BTstack context.
+static void bt_rate_follow_failed(const char *step, uint8_t status){
+    printf("[bt] SBC reconfigure to %lu Hz failed at %s (0x%02x); staying at %d Hz\n",
+           (unsigned long)s_rs_target, step, status, current_sample_rate);
+    s_sink_rate_caps &= (uint8_t)~bt_rate_cap_bit(s_rs_target);
+    s_rs_state = BT_RS_IDLE;
+    if (media_tracker.a2dp_cid && media_tracker.stream_opened)
+        a2dp_source_start_stream(media_tracker.a2dp_cid, media_tracker.local_seid);
+}
+
+// Main loop: start a rate follow when the pipeline left the link's rate.
+static void bt_service_rate_follow(void){
+    if (s_rs_state != BT_RS_IDLE || !s_bt_enabled || !media_tracker.a2dp_cid) return;
+    uint32_t want = bt_pipeline_rate();
+    if (want == (uint32_t)current_sample_rate) return;
+    if (!bt_rate_sink_supports(want, s_sink_rate_caps)) return;   // policy pins instead
+    printf("[bt] pipeline %lu Hz, link %d Hz: reconfiguring SBC\n",
+           (unsigned long)want, current_sample_rate);
+    s_rs_target = want;
+    s_rs_state  = BT_RS_PAUSING;
+    s_bt_enabled = false;                 // stop feeding wrong-rate audio to the FIFO
+    cyw43_arch_lwip_begin();
+    a2dp_timer_stop(&media_tracker);
+    uint8_t st = a2dp_source_pause_stream(media_tracker.a2dp_cid, media_tracker.local_seid);
+    if (st != ERROR_CODE_SUCCESS) bt_rate_follow_failed("pause", st);
+    cyw43_arch_lwip_end();
+}
+
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel); UNUSED(size);
     if (packet_type != HCI_EVENT_PACKET) return;
@@ -593,6 +653,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                     s_connecting = true;
                     memcpy(device_addr, sink, 6);
                     memcpy(s_target_addr, sink, 6);
+                    bt_prefer_pipeline_rate();
                     uint8_t st = a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
                     if (st != ERROR_CODE_SUCCESS){
                         printf("[bt] stored-sink reconnect failed to start (0x%02x); idle/scannable\n", st);
@@ -695,11 +756,22 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             }
             s_last_status = BT_ERR_NONE;
             s_a2dp_connected = true;
+            s_sink_rate_caps = 0;                 // re-learned from this sink's capabilities
+            s_rs_state = BT_RS_IDLE;
             memcpy(s_target_addr, address, 6);
             media_tracker.a2dp_cid = cid;
             media_tracker.volume = 32;
             printf("[bt] A2DP connected to %s, cid 0x%02x\n", bd_addr_to_str(address), cid);
             break;
+
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CAPABILITY: {
+            uint8_t caps = a2dp_subevent_signaling_media_codec_sbc_capability_get_sampling_frequency_bitmap(packet)
+                         & (BT_RATE_CAP_44100 | BT_RATE_CAP_48000);
+            s_sink_rate_caps |= caps;
+            printf("[bt] sink SBC rates:%s%s\n", (caps & BT_RATE_CAP_44100) ? " 44.1k" : "",
+                   (caps & BT_RATE_CAP_48000) ? " 48k" : "");
+            break;
+        }
 
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:
             cid = avdtp_subevent_signaling_media_codec_sbc_configuration_get_avdtp_cid(packet);
@@ -727,6 +799,7 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             dump_sbc_configuration(&sbc_configuration);
 
             current_sample_rate = sbc_configuration.sampling_frequency;
+            s_sink_rate_caps |= bt_rate_cap_bit((uint32_t)current_sample_rate);   // in use => supported
             s_codec = BT_CODEC_SBC;
             sbc_encoder_instance = btstack_sbc_encoder_bluedroid_init_instance(&sbc_encoder_state);
             sbc_encoder_instance->configure(&sbc_encoder_state, SBC_MODE_STANDARD,
@@ -766,6 +839,23 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             s_bt_enabled = false;
             a2dp_timer_stop(&media_tracker);
             printf("[bt] A2DP stream suspended\n");
+            if (s_rs_state == BT_RS_PAUSING){
+                status = a2dp_source_reconfigure_stream_sampling_frequency(media_tracker.a2dp_cid, s_rs_target);
+                if (status == ERROR_CODE_SUCCESS) s_rs_state = BT_RS_RECONFIG;
+                else bt_rate_follow_failed("reconfigure", status);
+            }
+            break;
+
+        case A2DP_SUBEVENT_STREAM_RECONFIGURED:
+            status = a2dp_subevent_stream_reconfigured_get_status(packet);
+            if (s_rs_state != BT_RS_RECONFIG) break;
+            if (status != ERROR_CODE_SUCCESS){
+                bt_rate_follow_failed("sink", status);
+                break;
+            }
+            printf("[bt] SBC reconfigured to %d Hz\n", current_sample_rate);
+            s_rs_state = BT_RS_IDLE;
+            a2dp_source_start_stream(media_tracker.a2dp_cid, media_tracker.local_seid);
             break;
 
         case A2DP_SUBEVENT_STREAM_RELEASED:
@@ -773,6 +863,7 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             cid = a2dp_subevent_stream_released_get_a2dp_cid(packet);
             if (cid == media_tracker.a2dp_cid) media_tracker.stream_opened = 0;
             a2dp_timer_stop(&media_tracker);
+            s_rs_state = BT_RS_IDLE;
             printf("[bt] A2DP stream released\n");
             break;
 
@@ -786,6 +877,8 @@ static void a2dp_source_packet_handler(uint8_t packet_type, uint16_t channel, ui
             s_a2dp_connected = false;
             s_connecting = false;
             s_codec = BT_CODEC_NONE;
+            s_sink_rate_caps = 0;
+            s_rs_state = BT_RS_IDLE;
             printf("[bt] A2DP signaling released\n");
             break;
 
@@ -1023,6 +1116,8 @@ static void bt_service_commands(void){
     }
     if (!s_hci_working) return;      // controller still coming up; keep requests pending
 
+    bt_service_rate_follow();
+
     // --- disconnect --------------------------------------------------------
     if (s_disconnect_pending){
         s_disconnect_pending = false;
@@ -1084,6 +1179,7 @@ static void bt_service_commands(void){
             s_connecting = true;
             s_last_status = BT_ERR_NONE;
             cyw43_arch_lwip_begin();
+            bt_prefer_pipeline_rate();
             uint8_t st = a2dp_source_establish_stream(device_addr, &media_tracker.a2dp_cid);
             cyw43_arch_lwip_end();
             if (st != ERROR_CODE_SUCCESS){
@@ -1261,6 +1357,10 @@ void bt_output_led(bool on){
 
 uint32_t bt_output_sink_rate(void){
     return bt_rate_sink_or_default((uint32_t)current_sample_rate);
+}
+
+uint8_t bt_output_sink_rate_caps(void){
+    return s_sink_rate_caps;
 }
 
 bool bt_output_user_enabled(void){
