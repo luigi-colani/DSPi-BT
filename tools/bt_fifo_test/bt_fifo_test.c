@@ -298,14 +298,20 @@ static void test_drift_baseline_fails(void) {
     CHECK(b.overflow > 0);
 }
 
+// The controller acts on a smoothed fill (~2^AVG_SHIFT pops, ~0.75 s), so the
+// instantaneous fill overshoots the LOW/HIGH band by up to drift x lag before
+// a correction mode engages: ~65 frames at 44.1 kHz / +2000 ppm (the extreme
+// tested); allow 2x that.
+#define AVG_LAG_ALLOW 128u
+
 static void check_bounded(const char *name, double fp, double fc, double secs) {
     drift_result_t r = run_drift(fp, fc, secs, 1, BT_FIFO_DRIFT_TARGET);
     report(name, r);
     CHECK_EQ_U(r.underflow, 0);
     CHECK_EQ_U(r.overflow, 0);
-    // Bounded: stays inside [LOW - one block, HIGH + one block].
-    CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK >= BT_FIFO_DRIFT_LOW);  // sampled post-pop
-    CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK);
+    // Bounded: stays inside [LOW - one block - lag, HIGH + one block + lag].
+    CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK + AVG_LAG_ALLOW >= BT_FIFO_DRIFT_LOW);  // sampled post-pop
+    CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK + AVG_LAG_ALLOW);
     CHECK(r.framing_ok);
     CHECK(r.lr_ok);
 }
@@ -343,9 +349,10 @@ static void test_drift_no_drift_is_quiet(void) {
 
 static void test_drift_hysteresis(void) {
     printf("test_drift_hysteresis (no thrash near a threshold)\n");
-    // Park fill just under LOW with matched clocks: dup mode engages once and
-    // holds until fill recovers past LOW_EXIT; corrections are one frame per
-    // pop, so recovery takes ~(LOW_EXIT-LOW) pops, not alternating each pop.
+    // Park fill (and its settled average) just under LOW with matched clocks:
+    // dup mode engages once and holds until the smoothed fill recovers past
+    // LOW_EXIT; corrections are one frame per pop, so recovery takes at least
+    // (LOW_EXIT-LOW) pops plus the averaging lag, never alternating each pop.
     bt_fifo_init(&fifo);
     bt_fifo_drift_init(&fifo);
     static float l[POP_CHUNK], r[POP_CHUNK];
@@ -354,8 +361,9 @@ static void test_drift_hysteresis(void) {
     uint32_t target = BT_FIFO_DRIFT_LOW - 1;
     while (bt_fifo_available(&fifo) < target) bt_fifo_push_n(&fifo, l, r, 1);
     fifo.primed = 1;                                  // steady state, not startup
+    fifo.drift_avg_q8 = target << 8;                  // ...with a settled average
     uint32_t dups_seen = 0, transitions = 0, prev_dup = 0;
-    for (int k = 0; k < 400; k++) {
+    for (int k = 0; k < 4000; k++) {
         uint32_t before = fifo.drift_duplicated_frames;
         bt_fifo_pop_drift(&fifo, out, POP_CHUNK);
         bt_fifo_push_n(&fifo, l, r, POP_CHUNK);       // matched clocks
@@ -384,8 +392,8 @@ static void test_drift_startup_from_empty(void) {
         CHECK_EQ_U(r.underflow, 0);               // hold-off: no startup underflow
         CHECK_EQ_U(r.overflow, 0);
         CHECK(r.min_fill != UINT32_MAX);          // got post-ramp samples
-        CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK >= BT_FIFO_DRIFT_LOW);
-        CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK);
+        CHECK(r.min_fill + POP_CHUNK + PUSH_CHUNK + AVG_LAG_ALLOW >= BT_FIFO_DRIFT_LOW);
+        CHECK(r.max_fill <= BT_FIFO_DRIFT_HIGH + POP_CHUNK + PUSH_CHUNK + AVG_LAG_ALLOW);
         CHECK(r.framing_ok);
     }
     // Reset re-arms the hold-off and clears drift mode.
@@ -394,6 +402,93 @@ static void test_drift_startup_from_empty(void) {
     CHECK_EQ_U(fifo.primed, 0);
     CHECK_EQ_U(fifo.drift_mode, BT_FIFO_DRIFT_IDLE);
     CHECK_EQ_U(bt_fifo_available(&fifo), 0);
+}
+
+// Bursty consumer with matched AVERAGE clocks: the A2DP media timer stalls
+// (radio / sink flow control) and then catches up, so the instantaneous fill
+// swings far past LOW/HIGH although nothing drifts.  The controller acts on
+// the smoothed fill, so jitter alone must not trigger corrections.
+static void test_drift_ignores_consumer_jitter(void) {
+    printf("test_drift_ignores_consumer_jitter (50 ms stalls + catch-up, matched clocks)\n");
+    bt_fifo_init(&fifo);
+    bt_fifo_drift_init(&fifo);
+    static float l[PUSH_CHUNK], r[PUSH_CHUNK];
+    static int16_t out[POP_CHUNK * 2];
+    for (uint32_t i = 0; i < PUSH_CHUNK; i++) { l[i] = 0.1f; r[i] = -0.1f; }
+    for (uint32_t i = 0; i < BT_FIFO_DRIFT_TARGET / PUSH_CHUNK + 1; i++)
+        bt_fifo_push_n(&fifo, l, r, PUSH_CHUNK);
+    // Wall clock in 1 ms steps (one PUSH_CHUNK each, i.e. exactly 48 kHz).
+    // The consumer owes one POP_CHUNK every POP_CHUNK/48000 s; during the
+    // first 50 ms of every second it is stalled, afterwards it pops every
+    // block it owes back-to-back (catch-up burst) — matched long-term rate.
+    const double dc = POP_CHUNK / 48000.0;
+    double tc = 0.0;
+    uint32_t min_fill = UINT32_MAX, max_fill = 0;
+    for (long ms = 0; ms < 600000; ms++) {
+        double w = ms / 1000.0;
+        bt_fifo_push_n(&fifo, l, r, PUSH_CHUNK);
+        if ((ms % 1000) < 50) continue;                     // stalled
+        while (tc <= w) {
+            bt_fifo_pop_drift(&fifo, out, POP_CHUNK);
+            uint32_t f = bt_fifo_available(&fifo);
+            if (f < min_fill) min_fill = f;
+            if (f > max_fill) max_fill = f;
+            tc += dc;
+        }
+    }
+    printf("  fill[%u..%u] uf=%u of=%u skip=%u dup=%u\n", min_fill, max_fill,
+           fifo.underflow_frames, fifo.overflow_frames,
+           fifo.drift_skipped_frames, fifo.drift_duplicated_frames);
+    CHECK(max_fill > BT_FIFO_DRIFT_HIGH);      // the jitter really crosses HIGH
+    CHECK_EQ_U(fifo.underflow_frames, 0);
+    CHECK_EQ_U(fifo.overflow_frames, 0);
+    CHECK_EQ_U(fifo.drift_skipped_frames, 0);
+    CHECK_EQ_U(fifo.drift_duplicated_frames, 0);
+}
+
+// Producer stops (host stream ends) while the consumer keeps popping: the
+// shortfall is counted once, then the hold-off re-arms (no further underflow
+// counting, no drift corrections on silence).  When the producer resumes,
+// output restarts only once the target cushion is rebuilt.
+static void test_underflow_rearms_prefill(void) {
+    printf("test_underflow_rearms_prefill (stream stop/resume)\n");
+    bt_fifo_init(&fifo);
+    bt_fifo_drift_init(&fifo);
+    static float l[POP_CHUNK], r[POP_CHUNK];
+    static int16_t out[POP_CHUNK * 2];
+    for (uint32_t i = 0; i < POP_CHUNK; i++) { l[i] = 0.1f; r[i] = -0.1f; }
+    while (bt_fifo_available(&fifo) < BT_FIFO_DRIFT_TARGET) bt_fifo_push_n(&fifo, l, r, POP_CHUNK);
+    // Steady state for a while (matched).
+    for (int k = 0; k < 1000; k++) {
+        CHECK_EQ_U(bt_fifo_pop_drift(&fifo, out, POP_CHUNK), POP_CHUNK);
+        bt_fifo_push_n(&fifo, l, r, POP_CHUNK);
+    }
+    CHECK_EQ_U(fifo.underflow_frames, 0);
+    // Producer stops: drain, then keep popping for a long time.
+    uint32_t pops_with_data = 0;
+    for (int k = 0; k < 5000; k++) {
+        if (bt_fifo_pop_drift(&fifo, out, POP_CHUNK) > 0) pops_with_data++;
+    }
+    printf("  after stop: uf=%u primed=%u pops_with_data=%u\n",
+           fifo.underflow_frames, fifo.primed, pops_with_data);
+    CHECK(fifo.underflow_frames > 0);                  // the real shortfall counts...
+    CHECK(fifo.underflow_frames <= POP_CHUNK);         // ...once, not per idle pop
+    CHECK_EQ_U(fifo.primed, 0);                        // hold-off re-armed
+    uint32_t uf_after_stop = fifo.underflow_frames;
+    uint32_t dup_after_stop = fifo.drift_duplicated_frames;
+    // Producer resumes at the same rate: silence until the cushion is back.
+    uint32_t silent_pops = 0;
+    for (int k = 0; k < 3000; k++) {
+        bt_fifo_push_n(&fifo, l, r, POP_CHUNK);
+        if (bt_fifo_pop_drift(&fifo, out, POP_CHUNK) == 0) silent_pops++;
+    }
+    printf("  after resume: uf=%u primed=%u silent_pops=%u fill=%u\n",
+           fifo.underflow_frames, fifo.primed, silent_pops, bt_fifo_available(&fifo));
+    CHECK_EQ_U(fifo.primed, 1);
+    CHECK_EQ_U(fifo.underflow_frames, uf_after_stop);  // no new underflow
+    CHECK(silent_pops > 0);                            // waited for the cushion
+    CHECK(bt_fifo_available(&fifo) + POP_CHUNK >= BT_FIFO_DRIFT_TARGET);
+    CHECK_EQ_U(fifo.drift_duplicated_frames, dup_after_stop);
 }
 
 int main(void) {
@@ -411,6 +506,8 @@ int main(void) {
     test_drift_no_drift_is_quiet();
     test_drift_hysteresis();
     test_drift_startup_from_empty();
+    test_drift_ignores_consumer_jitter();
+    test_underflow_rearms_prefill();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     if (failures) {

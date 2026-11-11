@@ -79,6 +79,7 @@ typedef struct {
     volatile uint32_t drift_skipped_frames;     // frames discarded (fill high)
     volatile uint32_t drift_duplicated_frames;  // frames repeated (fill low)
     volatile uint32_t drift_fill;               // fill seen at the last pop
+    volatile uint32_t drift_avg_q8;             // smoothed fill (Q24.8 EMA)
     volatile uint8_t  drift_mode;               // BT_FIFO_DRIFT_{IDLE,DUP,SKIP}
     volatile uint8_t  primed;                   // 0 = prefill hold-off active
 } bt_fifo_t;
@@ -97,12 +98,27 @@ typedef struct {
 // threshold.  The band sits around TARGET (~21 ms @ 48 kHz); the media timer
 // is held off (bt_fifo_pop_drift returns 0, no underflow counted, caller pads
 // silence) until fill first reaches TARGET after a reset/stream start.
+//
+// The thresholds are applied to a SMOOTHED fill (EMA over ~2^SHIFT pops,
+// ~0.75 s at 44.1 kHz / 128-frame blocks), not the instantaneous one: the A2DP
+// media timer stalls (radio / sink flow control) and then catches up in a
+// burst, which swings the instantaneous fill past LOW and HIGH within tens of
+// ms with no drift at all.  Reacting to that discarded and then repeated
+// frames for nothing (measured on hardware: both, within the same second).
+// Real drift moves the average; jitter does not.  Correction capacity is
+// unchanged (one frame per pop).
+//
+// A genuine underflow (ring ran dry inside a pop: producer stopped or
+// starved) is counted once and re-arms the TARGET hold-off, so a stopped host
+// stream does not count every padded pop as an underflow, and a resumed one
+// restarts with the full cushion rather than limping along near empty.
 // ---------------------------------------------------------------------------
 #define BT_FIFO_DRIFT_TARGET     1024u
 #define BT_FIFO_DRIFT_LOW         512u   // enter DUP below this
 #define BT_FIFO_DRIFT_LOW_EXIT    768u   // leave DUP at/above this
 #define BT_FIFO_DRIFT_HIGH       2048u   // enter SKIP above this
 #define BT_FIFO_DRIFT_HIGH_EXIT  1536u   // leave SKIP at/below this
+#define BT_FIFO_DRIFT_AVG_SHIFT     8u   // EMA weight 1/256 per pop
 
 enum { BT_FIFO_DRIFT_IDLE = 0, BT_FIFO_DRIFT_DUP = 1, BT_FIFO_DRIFT_SKIP = 2 };
 
@@ -118,6 +134,7 @@ static inline void bt_fifo_init(bt_fifo_t *f) {
     f->drift_skipped_frames = 0;
     f->drift_duplicated_frames = 0;
     f->drift_fill = 0;
+    f->drift_avg_q8 = 0;
     f->drift_mode = BT_FIFO_DRIFT_IDLE;
     f->primed = 0;
 }
@@ -232,37 +249,57 @@ static inline uint32_t bt_fifo_pop_drift(bt_fifo_t *f,
     if (!f->primed) {
         if (avail < BT_FIFO_DRIFT_TARGET) return 0;   // hold-off: silence
         f->primed = 1;
+        // Seed at TARGET, not avail: the hold-off guarantees avail >= TARGET,
+        // and any excess here is a transient (e.g. the first pops after a
+        // media-timer stall), not a drift the controller should chase.
+        f->drift_avg_q8 = BT_FIFO_DRIFT_TARGET << 8;
+        f->drift_mode = BT_FIFO_DRIFT_IDLE;
     }
+
+    // Smoothed fill drives the mode (see the policy notes above).
+    uint32_t avg_q8 = f->drift_avg_q8;
+    avg_q8 = avg_q8 + (uint32_t)(((int32_t)(avail << 8) - (int32_t)avg_q8)
+                                 >> BT_FIFO_DRIFT_AVG_SHIFT);
+    f->drift_avg_q8 = avg_q8;
+    const uint32_t avg = avg_q8 >> 8;
 
     uint8_t mode = f->drift_mode;
     if (mode == BT_FIFO_DRIFT_DUP) {
-        if (avail >= BT_FIFO_DRIFT_LOW_EXIT) mode = BT_FIFO_DRIFT_IDLE;
+        if (avg >= BT_FIFO_DRIFT_LOW_EXIT) mode = BT_FIFO_DRIFT_IDLE;
     } else if (mode == BT_FIFO_DRIFT_SKIP) {
-        if (avail <= BT_FIFO_DRIFT_HIGH_EXIT) mode = BT_FIFO_DRIFT_IDLE;
+        if (avg <= BT_FIFO_DRIFT_HIGH_EXIT) mode = BT_FIFO_DRIFT_IDLE;
     }
     if (mode == BT_FIFO_DRIFT_IDLE) {
-        if (avail < BT_FIFO_DRIFT_LOW)       mode = BT_FIFO_DRIFT_DUP;
-        else if (avail > BT_FIFO_DRIFT_HIGH) mode = BT_FIFO_DRIFT_SKIP;
+        if (avg < BT_FIFO_DRIFT_LOW)       mode = BT_FIFO_DRIFT_DUP;
+        else if (avg > BT_FIFO_DRIFT_HIGH) mode = BT_FIFO_DRIFT_SKIP;
     }
     f->drift_mode = mode;
 
+    uint32_t got;
     if (mode == BT_FIFO_DRIFT_SKIP && avail > n) {
         // Drop the oldest frame unread (tail is consumer-owned).
         __dmb();
         f->tail = (f->tail + 1) & BT_FIFO_MASK;
         f->drift_skipped_frames++;
-    } else if (mode == BT_FIFO_DRIFT_DUP && n >= 2 && avail >= 1) {
-        uint32_t got = bt_fifo_pop_n(f, interleaved, n - 1);
-        if (got == n - 1) {
-            interleaved[(n - 1) * 2]     = interleaved[(n - 2) * 2];
-            interleaved[(n - 1) * 2 + 1] = interleaved[(n - 2) * 2 + 1];
-            f->drift_duplicated_frames++;
-            return n;
-        }
-        f->underflow_frames += 1;   // pop_n counted n-1-got; real shortfall is n-got
-        return got;   // genuine underflow; caller pads silence
+        got = bt_fifo_pop_n(f, interleaved, n);
+    } else if (mode == BT_FIFO_DRIFT_DUP && n >= 2 && avail >= n - 1) {
+        got = bt_fifo_pop_n(f, interleaved, n - 1);   // full: avail >= n-1
+        interleaved[(n - 1) * 2]     = interleaved[(n - 2) * 2];
+        interleaved[(n - 1) * 2 + 1] = interleaved[(n - 2) * 2 + 1];
+        f->drift_duplicated_frames++;
+        return n;
+    } else {
+        got = bt_fifo_pop_n(f, interleaved, n);       // counts any shortfall
     }
-    return bt_fifo_pop_n(f, interleaved, n);
+
+    if (got < n) {
+        // Ran dry: the shortfall was counted once by pop_n; re-arm the
+        // hold-off so idle pops are silence (not underflows) and a resumed
+        // stream rebuilds the full cushion first.
+        f->primed = 0;
+        f->drift_mode = BT_FIFO_DRIFT_IDLE;
+    }
+    return got;
 }
 
 // ---------------------------------------------------------------------------

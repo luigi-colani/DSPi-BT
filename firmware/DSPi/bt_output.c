@@ -852,10 +852,11 @@ static void stats_timeout_handler(btstack_timer_source_t * ts){
     BtMetrics m = bt_output_metrics();
     printf("[btm] en=%d acb_ovr=%" PRIu32 " fifo_of=%" PRIu32 " fifo_uf=%" PRIu32
            " sbc_us_last=%" PRIu32 " sbc_us_max=%" PRIu32 " avail=%" PRIu32
-           " fill=%" PRIu32 " skip=%" PRIu32 " dup=%" PRIu32 "\n",
+           " fill=%" PRIu32 " avg=%" PRIu32 " skip=%" PRIu32 " dup=%" PRIu32 "\n",
            (int)s_bt_enabled, m.audio_callback_overruns, m.fifo_overflow_frames,
            m.fifo_underflow_frames, m.sbc_encode_us_last, m.sbc_encode_us_max,
            s_fifo ? bt_fifo_available(s_fifo) : 0u, m.fifo_fill_frames,
+           s_fifo ? (s_fifo->drift_avg_q8 >> 8) : 0u,
            m.fifo_drift_skip_frames, m.fifo_drift_dup_frames);
     btstack_run_loop_set_timer(ts, 1000);
     btstack_run_loop_add_timer(ts);
