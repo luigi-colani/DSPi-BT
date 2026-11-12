@@ -1,5 +1,16 @@
 # DSPi Firmware
 
+> **Compatibility: Raspberry Pi Pico 2 W only.** This is the DSPi Bluetooth firmware
+> ([luigi-colani/DSPi-BT](https://github.com/luigi-colani/DSPi-BT)), a fork of the official
+> [WeebLabs DSPi](https://github.com/WeebLabs/DSPi). It is built and tested only for the **Raspberry Pi Pico 2 W**
+> (`DSPI_BT` build, see [Building from Source](#building-from-source)). Other boards (Pico, Pico 2) are not supported
+> by this fork: the RP2040 / Pico 2 build options below are inherited from upstream and not tested here. For those
+> boards, use the official firmware.
+>
+> **Required host app:** control this firmware, including Bluetooth on/off, scanning and pairing, with the matching
+> **DSPi Console** from [luigi-colani/DSPi-Console-BT](https://github.com/luigi-colani/DSPi-Console-BT). The official
+> DSPi Console does not know the Bluetooth commands.
+
 **DSPi** transforms a Raspberry Pi Pico or other RP2040-based board into a very competent and inexpensive little digital audio processor. It acts as a USB sound card with an onboard DSP engine, allowing you to make use of essential tools like room correction, active crossovers, parametric EQ, time alignment, loudness compensation, and headphone crossfeed.
 
 It is my hope that the RP2040 and RP2350 will garner a reputation as the "swiss army knife of audio for less than a cup of coffee".
