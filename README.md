@@ -25,6 +25,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
   - [Master Volume](#master-volume)
   - [I2S Output](#i2s-output)
   - [Subwoofer PDM Output](#subwoofer-pdm-output)
+  - [Bluetooth Audio Output (Pico 2 W)](#bluetooth-audio-output-pico-2-w)
 - [User Presets](#user-presets)
 - [Developer Reference](#developer-reference)
   - [System Architecture](#system-architecture)
@@ -54,6 +55,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 *   **Master Volume:** Device-side output ceiling (-128 to 0 dB, with a true-mute sentinel) applied at the very end of the signal chain, independent of USB host volume and DSP processing. Two persistence modes: stored independently of presets (default — survives reboots, unaffected by preset switching) or saved/restored as part of each preset.
 *   **Per-Output Gain & Mute:** Independent gain and mute controls for each output channel.
 *   **Time Alignment:** Per-output delay (up to 85ms) for speaker/subwoofer alignment with automatic latency compensation between S/PDIF/I2S and PDM output paths.
+*   **Bluetooth Audio Output (Pico 2 W):** Optional build that streams the processed main output pair to Bluetooth headphones or a speaker (A2DP, SBC at 44.1/48 kHz) alongside the wired outputs. Scan, pair, connect and forget from the DSPi Console; the bond is stored on the device and reconnected at boot.
 *   **Subwoofer Output:** Dedicated mono PDM output channel with a high-performance 2nd-order delta-sigma modulator, enabling direct subwoofer output without the need for a second DAC.
 *   **Dual-Core DSP:** EQ processing is split across both cores on both platforms for maximum throughput when multiple outputs are active.
 *   **Configurable Output Pins:** All output GPIO pins (including I2S BCK/MCK) can be reassigned at runtime to suit custom PCB layouts, no reflashing required.
@@ -81,6 +83,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 | **Dual-Core EQ** | Yes (Core 1 processes outputs 3-4) | Yes (Core 1 processes outputs 3-8) |
 | **User Presets** | 10 slots | 10 slots |
 | **S/PDIF Input** | Yes | Yes |
+| **Bluetooth Output** | No | Pico 2 W only (`DSPI_BT` build) |
 | **Status** | Production | Production |
 
 Both platforms are fully tested and production-ready. The RP2040 reaches 307.2 MHz with a slight voltage bump; the RP2350 hits the same frequency at the same voltage. Clock is fixed (no rate-dependent switching), and PIO dividers are integer at every supported sample rate. The RP2350 offers significantly more processing headroom thanks to its hardware floating-point unit, enabling more output channels and a hybrid SVF/biquad filter architecture for improved low-frequency accuracy.
@@ -411,6 +414,20 @@ The subwoofer output uses a high-performance software-defined delta-sigma modula
 
 The objective was to use as much of Core 1 as necessary to produce an output that could be used full-range while sounding perfectly fine, even if it will only be used to feed a subwoofer. This implementation is very stable and without pops, clicks or idle tones.
 
+### Bluetooth Audio Output (Pico 2 W)
+
+On a **Raspberry Pi Pico 2 W** a dedicated firmware build (`DSPI_BT`, see [Building from Source](#building-from-source)) adds a Bluetooth audio output using the board's CYW43439 radio. Standard Pico / Pico 2 builds contain no radio code.
+
+*   **What is sent:** The processed main pair (outputs 1-2) is streamed to one A2DP sink (headphones or a speaker) as SBC, after per-output EQ, gain and delay. The wired outputs keep playing; Bluetooth is an additional tap, not a replacement.
+*   **Sample rate:** SBC carries 44.1 and 48 kHz. The Bluetooth link follows the pipeline rate whenever the sink supports it: a host or input switching between 44.1 and 48 kHz briefly pauses the Bluetooth stream (about a second) while it is reconfigured, without pitch shift or resampling. While Bluetooth streams, 96 kHz (and a rate a single-rate sink cannot take) is refused, so the host mixer resamples instead.
+*   **Pairing and control:** Bluetooth on/off, scan, connect (pairs on first connect), disconnect and forget are driven by the DSPi Console through the `REQ_BT` vendor command (see [USB Control Protocol](#usb-control-protocol)). The on/off state and the last connected device are stored on the device; at boot DSPi reconnects to the last device that is still paired. Bonds live in a dedicated 8 KB flash area directly below the preset storage, so they survive firmware updates and never touch presets.
+*   **Shared resources:** The radio needs a PIO state machine and DMA channels that the **PDM subwoofer** and **ADAT** outputs also use, so those two are stood down while Bluetooth is on and come back when it is turned off. Their *configured* state is kept: presets saved while Bluetooth is on store them as configured, and a change made meanwhile (preset load, disable) is what Bluetooth-off restores.
+*   **Clock drift:** The Bluetooth sender and the audio pipeline run from different clocks. A buffer of about 90 ms decouples them; a smoothed fill level drives single-frame corrections, so short radio hiccups cause none and only real drift (a few ppm) is corrected.
+*   **Robustness:** If the radio does not start, DSPi reports a radio error, gives the PDM/ADAT outputs back and keeps audio running; the next boot (or turning Bluetooth on again) retries. USB audio reception is unaffected by radio activity (see [System Architecture](#system-architecture)).
+*   **Developer extras (BT build):** a USB serial port prints a once-per-second `[btm]` metrics line (FIFO fill, corrections, SBC encode time), and opening that port at 1200 baud reboots into the UF2 bootloader. The on-board LED (driven through the radio chip) blinks once the radio is up.
+
+Details: `Documentation/current_architecture.md` and `firmware/DSPi/bt_proto.h` (wire formats).
+
 ---
 
 ## User Presets
@@ -443,6 +460,8 @@ DSPi includes a 10-slot preset system that stores complete DSP configurations in
     *   **RP2040:** 32-bit fixed-point (Q28) processing with hand-optimized ARM assembly for the inner DSP loop.
     *   **RP2350:** Single-precision float pipeline with hardware FPU. Hybrid SVF/biquad EQ — Cytomic SVF for low frequencies (below Fs/7.5), TDF2 biquad above. SVF provides superior numerical accuracy for low-frequency filters where biquad coefficient quantization becomes problematic.
 
+*   **USB audio intake:** Isochronous audio packets are received and the endpoint is re-armed inside the USB interrupt (link-time wraps of TinyUSB's DCD), not from the main loop. A main-loop stall therefore no longer drops USB packets; the packets queue in a small ring until the loop catches up. On the Pico 2 W the Bluetooth stack runs on Core 0 in a low-priority interrupt and relies on this.
+
 > **Note:** PDM mode and EQ Worker mode are mutually exclusive on Core 1. When the PDM output is enabled, Core 0 handles all S/PDIF output EQ processing. When PDM is disabled and higher-numbered outputs are active, Core 1 runs as an EQ worker for those outputs.
 
 ### Performance Tuning
@@ -466,6 +485,7 @@ Configuration is performed via **Interface 2** (Vendor Interface) using Control 
 
 | Code | Name | Direction | Payload | Description |
 | :--- | :--- | :--- | :--- | :--- |
+| `0x00` | `REQ_BT` | OUT / IN | see below | Bluetooth output command (Pico 2 W `DSPI_BT` builds; STALLs elsewhere) |
 | `0x42` | `REQ_SET_EQ_PARAM` | OUT | 16 bytes | Upload filter parameters |
 | `0x43` | `REQ_GET_EQ_PARAM` | IN | 16 bytes | Read filter parameters |
 | `0x44` | `REQ_SET_PREAMP` | OUT | 4 bytes | Set global gain (float dB) |
@@ -565,6 +585,22 @@ Configuration is performed via **Interface 2** (Vendor Interface) using Control 
 | `0xD6` | `REQ_SAVE_MASTER_VOLUME` | IN | 1 byte | Save live master volume to directory (mode 0 persistence) |
 | `0xD7` | `REQ_GET_SAVED_MASTER_VOLUME` | IN | 4 bytes | Read directory's saved master-volume value |
 | `0xF0` | `REQ_ENTER_BOOTLOADER` | IN | 1 byte | Reboot into UF2 bootloader for firmware update |
+
+### REQ_BT (0x00) - Bluetooth Output
+
+One request code in both directions; the operation is selected by `wValue`. Every operation that touches the radio is deferred to the main loop, so a SET only records the request; results appear in the status and in the `NOTIFY_EVT_BT_STATE` (0x11) notification.
+
+| Direction | wValue | Payload | Description |
+| :--- | :--- | :--- | :--- |
+| OUT | `0x0001` ENABLE | 1 byte (0/1) | Bluetooth off / on (persisted) |
+| OUT | `0x0002` SCAN | 1 byte (1 = start, 0 = stop) | Inquiry scan for nearby devices |
+| OUT | `0x0003` CONNECT | 6 bytes (BD_ADDR, textual order) | Connect and pair; becomes the boot-reconnect device |
+| OUT | `0x0004` DISCONNECT | 1 dummy byte | Drop the current link |
+| OUT | `0x0005` FORGET | 6 bytes (BD_ADDR) | Delete the bond (and drop its link) |
+| IN | `0x0001` STATUS | 16 bytes | State, flags, codec, volume, peer address, SBC rate, scan count, last error |
+| IN | `(index << 8) \| 0x0002` SCAN_RESULT | 32 bytes | One scan result (address, RSSI, flags, class of device, name) |
+
+An unknown operation, a non-zero high byte on OUT, or a short payload STALLs. Builds without Bluetooth STALL every `0x00` request, so a host detects Bluetooth support with the IN status request.
 
 ### REQ_GET_STATUS (0x50) - System Telemetry
 
@@ -773,6 +809,15 @@ cmake -DPICO_BOARD=pico2 -DPICO_EXTRAS_PATH=../firmware/pico-extras ../firmware
 make
 ```
 *Output:* `DSPi/DSPi.uf2`
+
+**Option C: Build for RP2350 with Bluetooth (Pico 2 W)**
+```bash
+mkdir build-rp2350-btw
+cd build-rp2350-btw
+cmake -DPICO_BOARD=pico2_w -DDSPI_BT=ON -DPICO_EXTRAS_PATH=../firmware/pico-extras ../firmware
+make
+```
+*Output:* `DSPi/DSPi.uf2`. `DSPI_BT=ON` requires `PICO_BOARD=pico2_w` and links the CYW43 driver, BTstack and the SBC encoder. It also divides the radio's SPI clock for DSPi's 307.2 MHz system clock and places the Bluetooth bond storage below the presets.
 
 ### 4. Flash the Device
 1.  Hold the **BOOTSEL** button on your board while plugging it in.
